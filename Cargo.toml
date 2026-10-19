@@ -3,7 +3,7 @@ name = "websrv"
 version = "0.5.1"
 edition = "2021"
 rust-version = "1.82"
-license = "MIT"
+license = "Apache-2.0"
 description = "Linux-only HTTP/3, HTTP/2, and HTTP/1.1 server using a mandatory io_uring runtime, host-based static sites, and modular in-process REST controllers"
 
 [dependencies]

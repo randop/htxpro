@@ -5,10 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY Cargo.toml ./
 COPY src ./src
-COPY config.yaml ./config.yaml
 COPY public ./public
 COPY sites ./sites
-COPY LICENSE-MIT ./LICENSE-MIT
 RUN cargo build --release
 
 FROM debian:bookworm-slim AS runtime

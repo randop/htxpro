@@ -99,7 +99,8 @@ where
                 });
             }
             Ok(Some(Err(error))) => {
-                debug!(%peer_ip, %error, "HTTP/2 stream rejected by protocol layer");
+                debug!(%peer_ip, %error, "HTTP/2 protocol error; closing connection");
+                return Err(anyhow::anyhow!("HTTP/2 connection failed: {error}"));
             }
         }
     }
@@ -182,14 +183,7 @@ async fn handle_request(
         None => (raw_path.to_owned(), None),
     };
 
-    let mut headers = HashMap::new();
-    for (name, value) in parts.headers.iter() {
-        let value = value
-            .to_str()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|_| String::from_utf8_lossy(value.as_bytes()).into_owned());
-        headers.insert(name.as_str().to_ascii_lowercase(), value);
-    }
+    let headers = collect_headers(&parts.headers);
 
     let body_limit = app.max_request_body_bytes();
     let mut body = Vec::with_capacity(body_limit.min(16 * 1024));
@@ -373,4 +367,44 @@ async fn send_response(
         }
     }
     Ok(())
+}
+
+fn collect_headers(source: &http::HeaderMap) -> HashMap<String, String> {
+    let mut headers = HashMap::<String, String>::new();
+    for (name, value) in source.iter() {
+        let name = name.as_str().to_ascii_lowercase();
+        let separator = if name == "cookie" { "; " } else { ", " };
+        let value = value
+            .to_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|_| String::from_utf8_lossy(value.as_bytes()).into_owned());
+        headers
+            .entry(name)
+            .and_modify(|existing| {
+                existing.push_str(separator);
+                existing.push_str(&value);
+            })
+            .or_insert(value);
+    }
+    headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_headers;
+    use http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn repeated_headers_are_combined_with_protocol_separators() {
+        let mut source = HeaderMap::new();
+        source.append("cookie", HeaderValue::from_static("a=1"));
+        source.append("cookie", HeaderValue::from_static("b=2"));
+        source.append("accept", HeaderValue::from_static("text/html"));
+        source.append("accept", HeaderValue::from_static("application/json"));
+        source.insert("x-single", HeaderValue::from_static("unchanged"));
+        let headers = collect_headers(&source);
+        assert_eq!(headers["cookie"], "a=1; b=2");
+        assert_eq!(headers["accept"], "text/html, application/json");
+        assert_eq!(headers["x-single"], "unchanged");
+    }
 }
