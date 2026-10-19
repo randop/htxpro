@@ -16,7 +16,7 @@ pub async fn handle(
         "status" => HttpResponse::json(
             200,
             json!({
-                "service": "websrv",
+                "service": env!("CARGO_PKG_NAME"),
                 "version": env!("CARGO_PKG_VERSION"),
                 "protocols": ["https/3", "http/1.1", "https/1.1", "http/2", "https/2"]
             }),

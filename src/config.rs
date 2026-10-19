@@ -16,18 +16,14 @@ const DEFAULT_STATIC_LIMIT: usize = 16 * 1024 * 1024;
 struct RawConfig {
     #[serde(default = "default_listen")]
     listen: String,
-    /// Enables HTTP/1.1 over TLS on the secure TCP listener.
     #[serde(default = "default_http1_secure_enabled")]
     http1_secure_enabled: bool,
-    /// Enables cleartext HTTP/1.1 on the shared plain listener.
     #[serde(default)]
     http1_plain_enabled: bool,
     #[serde(default = "default_plain_listen")]
     plain_listen: String,
-    /// Enables HTTP/2 over TLS ALPN on the secure TCP listener.
     #[serde(default = "default_http2_secure_enabled")]
     http2_secure_enabled: bool,
-    /// Enables cleartext HTTP/2 prior-knowledge (h2c) on the shared plain listener.
     #[serde(default)]
     http2_plain_enabled: bool,
     #[serde(default = "default_cert_path")]
@@ -102,7 +98,6 @@ impl Default for TimeoutConfig {
     }
 }
 
-/// Resource bounds shared across all enabled transports.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitConfig {
@@ -166,7 +161,6 @@ impl Default for RateLimitConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VirtualHostConfig {
-    /// Exact hostname or wildcard such as `*.example.com`.
     pub host: String,
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -228,7 +222,7 @@ fn default_static_limit() -> usize {
     DEFAULT_STATIC_LIMIT
 }
 fn default_log_filter() -> String {
-    "info,websrv=info".to_owned()
+    concat!("info,", env!("CARGO_PKG_NAME"), "=info").to_owned()
 }
 fn default_index() -> String {
     "index.html".to_owned()
@@ -647,7 +641,6 @@ fn validate_route_pattern(path: &str) -> Result<()> {
     Ok(())
 }
 
-// Keep dependency-independent header validation in a tiny module for startup-time checks.
 mod http_validation {
     use anyhow::{ensure, Result};
 

@@ -1,16 +1,17 @@
 #![cfg_attr(not(target_os = "linux"), allow(unused))]
 
 #[cfg(not(target_os = "linux"))]
-compile_error!(
-    "websrv requires Linux and io_uring; non-io_uring runtime drivers are not supported"
-);
+compile_error!(concat!(
+    env!("CARGO_PKG_NAME"),
+    " requires Linux and io_uring; non-io_uring runtime drivers are not supported"
+));
 
 mod config;
 mod controllers;
 mod http1_server;
 mod http2_server;
+mod http3_server;
 mod http_types;
-mod quic_server;
 mod static_site;
 
 use std::path::PathBuf;
@@ -24,8 +25,8 @@ fn main() -> Result<()> {
     init_tracing(&config.log_filter)?;
     info!(path = %config_path.display(), "loaded YAML configuration");
 
-    let quic_config = quic_server::make_quic_config(&config)?;
-    let shutdown = quic_server::install_shutdown_handler()?;
+    let quic_config = http3_server::make_quic_config(&config)?;
+    let shutdown = http3_server::install_shutdown_handler()?;
 
     // Intentionally select only Monoio's io_uring driver. There is no fusion/legacy
     // mode in Cargo features, and failure to create the ring aborts startup.
@@ -34,7 +35,7 @@ fn main() -> Result<()> {
         .build()
         .context("could not initialize the mandatory io_uring runtime; check kernel support and seccomp policy")?;
 
-    runtime.block_on(quic_server::serve(config, quic_config, shutdown))
+    runtime.block_on(http3_server::serve(config, quic_config, shutdown))
 }
 
 fn init_tracing(log_filter: &str) -> Result<()> {
@@ -56,7 +57,10 @@ fn config_path_from_args() -> Result<PathBuf> {
         if arg == "--config" || arg == "-c" {
             config_path = PathBuf::from(args.next().context("--config requires a path")?);
         } else if arg == "--help" || arg == "-h" {
-            println!("Usage: websrv [--config <path>]\n\nOptions:\n  -c, --config <path>  YAML configuration file (default: config.yaml)\n  -h, --help           Show this help message");
+            println!(
+                "Usage: {} [--config <path>]\n\nOptions:\n  -c, --config <path>  YAML configuration file (default: config.yaml)\n  -h, --help           Show this help message",
+                env!("CARGO_PKG_NAME")
+            );
             std::process::exit(0);
         } else if let Some(value) = arg.to_str().and_then(|arg| arg.strip_prefix("--config=")) {
             config_path = PathBuf::from(value);

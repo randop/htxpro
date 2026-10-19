@@ -948,7 +948,8 @@ pub async fn serve(
         http2_plain_enabled,
         secure_listen = %secure_listen,
         plain_listen = %plain_listen,
-        "websrv started"
+        "{} started",
+        env!("CARGO_PKG_NAME")
     );
 
     while let Some(event) = event_rx.next().await {
@@ -1464,7 +1465,7 @@ fn pump_outgoing(session: &mut Session) {
             let content_length = body_len.to_string();
             let mut headers = vec![
                 quiche::h3::Header::new(b":status", status.as_bytes()),
-                quiche::h3::Header::new(b"server", b"websrv"),
+                quiche::h3::Header::new(b"server", env!("CARGO_PKG_NAME").as_bytes()),
                 quiche::h3::Header::new(b"content-type", content_type.as_bytes()),
             ];
             if !matches!(status_code, 204 | 304) {
@@ -1508,7 +1509,6 @@ fn pump_outgoing(session: &mut Session) {
             }
         }
 
-        // Refresh the current stream's body offset after possibly sending headers.
         let Some(front) = session.outgoing.front() else {
             break;
         };

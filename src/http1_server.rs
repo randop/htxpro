@@ -19,8 +19,8 @@ use rustls::ServerConfig;
 use tracing::{debug, info, warn};
 
 use crate::{
+    http3_server::{AppRuntime, RequestGuard, TcpConnectionGuard},
     http_types::{HttpRequest, HttpResponse},
-    quic_server::{AppRuntime, RequestGuard, TcpConnectionGuard},
 };
 
 const SOCKET_READ_BYTES: usize = 16 * 1024;
@@ -553,8 +553,14 @@ where
         response.content_type.as_str()
     };
     let mut headers = format!(
-        "HTTP/1.1 {} {}\r\nserver: websrv\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: {}\r\nx-content-type-options: nosniff\r\nalt-svc: h3=\":{}\"; ma=86400\r\n",
-        response.status, reason, safe_content_type, content_length, connection, quic_port,
+        "HTTP/1.1 {} {}\r\nserver: {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: {}\r\nx-content-type-options: nosniff\r\nalt-svc: h3=\":{}\"; ma=86400\r\n",
+        response.status,
+        reason,
+        env!("CARGO_PKG_NAME"),
+        safe_content_type,
+        content_length,
+        connection,
+        quic_port,
     );
     if let Some(cache_control) = &response.cache_control {
         if !cache_control

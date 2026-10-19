@@ -12,9 +12,9 @@ RUN cargo build --release
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --create-home websrv
+    && useradd --system --uid 10001 --create-home htxpro
 WORKDIR /app
-COPY --from=builder /build/target/release/websrv /app/websrv
+COPY --from=builder /build/target/release/htxpro /app/htxpro
 COPY --from=builder /build/public /app/public
 COPY --from=builder /build/sites /app/sites
 COPY deploy/config.docker.yaml /app/config.yaml
@@ -23,4 +23,4 @@ USER 10001:10001
 EXPOSE 8443/udp
 EXPOSE 8443/tcp
 EXPOSE 8080/tcp
-ENTRYPOINT ["/app/websrv"]
+ENTRYPOINT ["/app/htxpro"]

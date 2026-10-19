@@ -8,7 +8,7 @@ tls_cert: "certs/fullchain.pem"
 tls_key: "certs/privkey.pem"
 max_request_body_bytes: 1048576
 max_static_file_bytes: 16777216
-log_filter: "info,websrv=debug"
+log_filter: "info,htxpro=debug"
 timeouts:
   tls_handshake_ms: 5000
   request_headers_ms: 5000

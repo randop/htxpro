@@ -9,7 +9,7 @@ tls_cert: "/run/secrets/tls_cert"
 tls_key: "/run/secrets/tls_key"
 max_request_body_bytes: 1048576
 max_static_file_bytes: 16777216
-log_filter: "info,websrv=info"
+log_filter: "info,htxpro=info"
 timeouts:
   tls_handshake_ms: 5000
   request_headers_ms: 5000

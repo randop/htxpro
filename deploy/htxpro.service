@@ -1,14 +1,14 @@
 [Unit]
-Description=websrv io_uring HTTP/3, HTTP/2, HTTPS/1.1, and cleartext HTTP/1.1 server
+Description=htxpro io_uring HTTP/3, HTTP/2, HTTPS/1.1, and cleartext HTTP/1.1 server
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=websrv
-Group=websrv
-WorkingDirectory=/opt/websrv
-ExecStart=/opt/websrv/bin/websrv --config /opt/websrv/config.yaml
+User=htxpro
+Group=htxpro
+WorkingDirectory=/opt/htxpro
+ExecStart=/opt/htxpro/bin/htxpro --config /opt/htxpro/config.yaml
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=20

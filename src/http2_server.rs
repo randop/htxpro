@@ -16,8 +16,8 @@ use monoio_http::h2::{server, RecvStream};
 use tracing::debug;
 
 use crate::{
+    http3_server::AppRuntime,
     http_types::{HttpRequest, HttpResponse},
-    quic_server::AppRuntime,
 };
 
 struct ActiveStreamGuard(Rc<Cell<usize>>);
@@ -311,7 +311,7 @@ async fn send_response(
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut builder = Response::builder()
         .status(status)
-        .header(header::SERVER, "websrv")
+        .header(header::SERVER, env!("CARGO_PKG_NAME"))
         .header(header::CONTENT_TYPE, safe_content_type)
         .header(header::CONTENT_LENGTH, content_length.to_string())
         .header("x-content-type-options", "nosniff")
