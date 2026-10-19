@@ -1,0 +1,38 @@
+[package]
+name = "htxpro"
+version = "0.5.1"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "Linux-only HTTP/3, HTTP/2, and HTTP/1.1 server using a mandatory io_uring runtime, host-based static sites, and modular in-process REST controllers"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+http = "1"
+monoio-http = "0.3.12"
+monoio-rustls = "0.4.0"
+signal-hook = "0.3"
+futures = "0.3"
+mime_guess = "2"
+monoio = { version = "0.2.4", default-features = false, features = ["iouring", "utils"] }
+percent-encoding = "2"
+quiche = "0.24.6"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+yaml_serde = "0.10"
+
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.release.package."*"]
+opt-level = 3
