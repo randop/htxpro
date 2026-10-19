@@ -1,0 +1,97 @@
+listen: "0.0.0.0:8443"
+plain_listen: "0.0.0.0:8080"
+http1_secure_enabled: true
+http1_plain_enabled: true
+http2_secure_enabled: true
+http2_plain_enabled: true
+tls_cert: "certs/fullchain.pem"
+tls_key: "certs/privkey.pem"
+max_request_body_bytes: 1048576
+max_static_file_bytes: 16777216
+log_filter: "info,websrv=debug"
+timeouts:
+  tls_handshake_ms: 5000
+  request_headers_ms: 5000
+  request_body_ms: 10000
+  request_process_ms: 5000
+  response_write_ms: 10000
+  keep_alive_idle_ms: 15000
+limits:
+  max_inflight_requests: 256
+  max_inflight_requests_per_ip: 32
+  max_inflight_requests_per_host: 128
+  max_inflight_static_requests: 16
+  max_inflight_controller_requests: 128
+  max_concurrent_streams_per_connection: 128
+  max_header_bytes: 65536
+  max_tcp_connections: 256
+  max_tcp_connections_per_ip: 32
+  max_quic_connections: 512
+  max_quic_connections_per_ip: 64
+  max_tracked_client_ips: 65536
+rate_limit:
+  enabled: true
+  global_requests_per_second: 1000
+  global_burst: 2000
+  requests_per_second_per_ip: 20
+  burst_per_ip: 40
+
+# Requests on HTTP/3, HTTP/2, and both HTTP/1.1 listeners 
+# are routed by :authority / Host. 
+# Exact names are checked before wildcards.
+default_host: "example.test"
+virtual_hosts:
+  - host: "example.test"
+    aliases: ["www.example.test"]
+    static:
+      root: "public"
+      index: "index.html"
+      spa_fallback: false
+      cache_control: "public, max-age=60"
+
+  - host: "*.tenant.example.test"
+    static:
+      root: "sites/tenant"
+      index: "index.html"
+      spa_fallback: true
+      cache_control: "public, max-age=300"
+
+  - host: "api.example.test"
+    controller: "public_api"
+
+controllers:
+  public_api:
+    routes:
+      - method: "GET"
+        path: "/healthz"
+        handler: "health"
+      - method: "GET"
+        path: "/status"
+        handler: "status"
+      - method: "GET"
+        path: "/metrics"
+        handler: "metrics"
+      - method: "POST"
+        path: "/echo"
+        handler: "echo"
+      - method: "GET"
+        path: "/v1/items"
+        handler: "items"
+      - method: "POST"
+        path: "/v1/items"
+        handler: "items"
+      - method: "GET"
+        path: "/v1/items/{id}"
+        handler: "items"
+      - method: "HEAD"
+        path: "/v1/items/{id}"
+        handler: "items"
+      - method: "PUT"
+        path: "/v1/items/{id}"
+        handler: "items"
+      - method: "PATCH"
+        path: "/v1/items/{id}"
+        handler: "items"
+      - method: "DELETE"
+        path: "/v1/items/{id}"
+        handler: "items"
