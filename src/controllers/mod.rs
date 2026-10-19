@@ -11,14 +11,13 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use serde_json::Value;
 
 use crate::{
     config::{ControllerConfig, ControllerRouteConfig},
     http_types::{HttpRequest, HttpResponse},
 };
 
-pub type ItemStore = Rc<RefCell<BTreeMap<String, Value>>>;
+pub type ItemStore = Rc<RefCell<items::StoreState>>;
 
 #[derive(Clone)]
 struct CompiledRoute {
@@ -52,7 +51,7 @@ impl ControllerRuntime {
         }
         Ok(Self {
             tables: Rc::new(tables),
-            item_store: Rc::new(RefCell::new(BTreeMap::new())),
+            item_store: Rc::new(RefCell::new(items::StoreState::default())),
             max_body_bytes,
         })
     }

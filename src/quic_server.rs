@@ -22,8 +22,8 @@ use futures::{
 };
 use monoio::net::udp::UdpSocket;
 use quiche::h3::NameValue;
-use ring::rand::SecureRandom;
-use tracing::{debug, error, info, warn};
+use ring::{hmac, rand::SecureRandom};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::Config,
@@ -36,6 +36,78 @@ const UDP_READ_BUFFER: usize = 65_535;
 const QUIC_PACKET_BUFFER: usize = 1350;
 const TIMER_TICK: Duration = Duration::from_millis(5);
 const RESPONSE_CHUNK: usize = 16 * 1024;
+
+// Tokens authenticate the peer, Retry CID, original CID and issuance time without
+// retaining any per-client state before address validation.
+struct RetryTokens {
+    key: hmac::Key,
+    started: Instant,
+}
+
+impl RetryTokens {
+    fn new() -> Result<Self> {
+        let key = hmac::Key::generate(hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
+            .map_err(|_| anyhow::anyhow!("could not generate QUIC Retry key"))?;
+        Ok(Self {
+            key,
+            started: Instant::now(),
+        })
+    }
+
+    fn authenticated_data(peer: SocketAddr, retry_cid: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        match peer.ip() {
+            IpAddr::V4(ip) => {
+                data.push(4);
+                data.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                data.push(6);
+                data.extend_from_slice(&ip.octets());
+            }
+        }
+        data.extend_from_slice(&peer.port().to_be_bytes());
+        data.extend_from_slice(retry_cid);
+        data.extend_from_slice(payload);
+        data
+    }
+
+    fn mint(&self, peer: SocketAddr, retry_cid: &[u8], original_cid: &[u8]) -> Vec<u8> {
+        let mut token = self.started.elapsed().as_secs().to_be_bytes().to_vec();
+        token.extend_from_slice(original_cid);
+        let tag = hmac::sign(
+            &self.key,
+            &Self::authenticated_data(peer, retry_cid, &token),
+        );
+        token.extend_from_slice(tag.as_ref());
+        token
+    }
+
+    fn validate<'a>(
+        &self,
+        peer: SocketAddr,
+        retry_cid: &[u8],
+        token: &'a [u8],
+    ) -> Option<quiche::ConnectionId<'a>> {
+        if retry_cid.len() != quiche::MAX_CONN_ID_LEN
+            || !(8 + 8 + 32..=8 + quiche::MAX_CONN_ID_LEN + 32).contains(&token.len())
+        {
+            return None;
+        }
+        let (payload, tag) = token.split_at(token.len() - 32);
+        hmac::verify(
+            &self.key,
+            &Self::authenticated_data(peer, retry_cid, payload),
+            tag,
+        )
+        .ok()?;
+        let issued = u64::from_be_bytes(payload[..8].try_into().ok()?);
+        if self.started.elapsed().as_secs().checked_sub(issued)? > 10 {
+            return None;
+        }
+        Some(quiche::ConnectionId::from_ref(&payload[8..]))
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct AppRuntime {
@@ -252,30 +324,6 @@ impl AppRuntime {
             return Err(AdmissionError::GlobalCapacity);
         }
 
-        if self.config.rate_limit.enabled {
-            // Borrow the two token-bucket fields as disjoint fields of the state.
-            // This keeps the refill timestamp updated even when a request is denied.
-            let global_rate_allowed = {
-                let ProtectionState {
-                    global_tokens,
-                    global_last_refill,
-                    ..
-                } = &mut *state;
-                take_rate_limit_token(
-                    global_tokens,
-                    global_last_refill,
-                    now,
-                    self.config.rate_limit.global_requests_per_second,
-                    self.config.rate_limit.global_burst,
-                )
-            };
-            if !global_rate_allowed {
-                state.counters.global_rate_limited =
-                    state.counters.global_rate_limited.saturating_add(1);
-                return Err(AdmissionError::GlobalRateLimited);
-            }
-        }
-
         // Expire inactive rate-limit entries before admitting a new source. The
         // table is bounded even when an attacker sprays random source addresses.
         state.clients.retain(|_, budget| {
@@ -357,6 +405,30 @@ impl AppRuntime {
             state.counters.rejected_workload = state.counters.rejected_workload.saturating_add(1);
             return Err(AdmissionError::WorkloadCapacity);
         }
+        if self.config.rate_limit.enabled {
+            // Borrow the two token-bucket fields as disjoint fields of the state.
+            // This keeps the refill timestamp updated even when a request is denied.
+            let global_rate_allowed = {
+                let ProtectionState {
+                    global_tokens,
+                    global_last_refill,
+                    ..
+                } = &mut *state;
+                take_rate_limit_token(
+                    global_tokens,
+                    global_last_refill,
+                    now,
+                    self.config.rate_limit.global_requests_per_second,
+                    self.config.rate_limit.global_burst,
+                )
+            };
+            if !global_rate_allowed {
+                state.counters.global_rate_limited =
+                    state.counters.global_rate_limited.saturating_add(1);
+                return Err(AdmissionError::GlobalRateLimited);
+            }
+        }
+
         if let Some(client) = state.clients.get_mut(&client_ip) {
             client.in_flight += 1;
         }
@@ -861,6 +933,7 @@ pub async fn serve(
     });
     drop(event_tx);
 
+    let retry_tokens = RetryTokens::new()?;
     let mut sessions: HashMap<Vec<u8>, Session> = HashMap::new();
     // Initial packets use a client-chosen original destination CID until the server's
     // source CID is observed. Keep that original CID as an alias for Initial retries.
@@ -881,7 +954,7 @@ pub async fn serve(
     while let Some(event) = event_rx.next().await {
         match event {
             ServerEvent::Datagram { bytes, peer } => {
-                handle_datagram(
+                if let Some(packet) = handle_datagram(
                     bytes,
                     peer,
                     local_addr,
@@ -891,7 +964,13 @@ pub async fn serve(
                     &mut cid_aliases,
                     &app,
                     request_event_tx.clone(),
-                );
+                    &retry_tokens,
+                ) {
+                    let (result, _) = socket.send_to(packet, peer).await;
+                    if let Err(error) = result {
+                        debug!(%peer, %error, "could not send stateless QUIC response");
+                    }
+                }
                 pump_all(&socket, &mut sessions).await;
             }
             ServerEvent::Response {
@@ -961,55 +1040,79 @@ fn handle_datagram(
     cid_aliases: &mut HashMap<Vec<u8>, Vec<u8>>,
     app: &AppRuntime,
     event_tx: mpsc::Sender<ServerEvent>,
-) {
-    // QUIC routing is by destination connection ID, not just the UDP peer tuple: a
-    // browser can multiplex several QUIC connections through one UDP socket. This build
-    // explicitly disables active migration, but CID routing avoids conflating connections.
-    let (packet_type, packet_dcid) =
-        match quiche::Header::from_slice(&mut bytes, quiche::MAX_CONN_ID_LEN) {
-            Ok(header) => (header.ty, header.dcid.as_ref().to_vec()),
-            Err(_) => return,
-        };
-
+    retry_tokens: &RetryTokens,
+) -> Option<Vec<u8>> {
+    // Route existing connections before considering allocation for a new peer.
+    let header = quiche::Header::from_slice(&mut bytes, quiche::MAX_CONN_ID_LEN).ok()?;
+    if header.ty == quiche::Type::Initial && bytes.len() < 1200 {
+        return None;
+    }
+    let packet_dcid = header.dcid.as_ref().to_vec();
+    let mut new_session = false;
     let connection_id = if let Some((key, _)) = sessions.get_key_value(&packet_dcid) {
         key.clone()
     } else if let Some(key) = cid_aliases.get(&packet_dcid) {
         key.clone()
     } else {
-        if packet_type != quiche::Type::Initial {
-            return;
+        if !quiche::version_is_supported(header.version) && header.version != 0 {
+            let mut packet = vec![0; QUIC_PACKET_BUFFER];
+            let written =
+                quiche::negotiate_version(&header.scid, &header.dcid, &mut packet).ok()?;
+            packet.truncate(written);
+            return Some(packet);
         }
+        if header.ty != quiche::Type::Initial || header.dcid.len() < 8 {
+            return None;
+        }
+        let token = header.token.as_deref().unwrap_or_default();
+        if token.is_empty() {
+            let mut server_cid = [0; quiche::MAX_CONN_ID_LEN];
+            ring::rand::SystemRandom::new().fill(&mut server_cid).ok()?;
+            let scid = quiche::ConnectionId::from_ref(&server_cid);
+            let token = retry_tokens.mint(peer, &server_cid, &packet_dcid);
+            let mut packet = vec![0; QUIC_PACKET_BUFFER];
+            let written = quiche::retry(
+                &header.scid,
+                &header.dcid,
+                &scid,
+                &token,
+                header.version,
+                &mut packet,
+            )
+            .ok()?;
+            packet.truncate(written);
+            return Some(packet);
+        }
+        let original_cid = retry_tokens.validate(peer, &packet_dcid, token)?;
         let Some(connection_guard) = app.acquire_quic_connection(peer.ip()) else {
             debug!(%peer, "QUIC connection or client tracking limit reached; ignoring new peer");
-            return;
+            return None;
         };
-        let mut server_cid = [0u8; quiche::MAX_CONN_ID_LEN];
-        if ring::rand::SystemRandom::new()
-            .fill(&mut server_cid)
-            .is_err()
-        {
-            error!(%peer, "secure random generation failed while creating QUIC connection id");
-            return;
-        }
-        let scid = quiche::ConnectionId::from_ref(&server_cid);
-        let key = server_cid.to_vec();
-        match quiche::accept(&scid, None, local_addr, peer, quic_config) {
+        match quiche::accept(
+            &header.dcid,
+            Some(&original_cid),
+            local_addr,
+            peer,
+            quic_config,
+        ) {
             Ok(conn) => {
-                sessions.insert(key.clone(), Session::new(conn, peer, connection_guard));
-                if !packet_dcid.is_empty() {
-                    cid_aliases.insert(packet_dcid, key.clone());
-                }
-                key
+                sessions.insert(
+                    packet_dcid.clone(),
+                    Session::new(conn, peer, connection_guard),
+                );
+                cid_aliases.insert(packet_dcid.clone(), packet_dcid.clone());
+                new_session = true;
+                packet_dcid
             }
             Err(error) => {
                 debug!(%peer, %error, "rejected QUIC Initial packet");
-                return;
+                return None;
             }
         }
     };
 
     let Some(session) = sessions.get_mut(&connection_id) else {
-        return;
+        return None;
     };
     let recv_info = quiche::RecvInfo {
         from: peer,
@@ -1017,7 +1120,11 @@ fn handle_datagram(
     };
     if let Err(error) = session.conn.recv(&mut bytes, recv_info) {
         debug!(%peer, %error, "discarding invalid QUIC datagram");
-        return;
+        if new_session {
+            sessions.remove(&connection_id);
+            cid_aliases.retain(|_, key| key != &connection_id);
+        }
+        return None;
     }
     // Start a header deadline when a client-initiated bidirectional stream first
     // becomes readable. Remove it once quiche has decoded the HEADERS event.
@@ -1045,7 +1152,7 @@ fn handle_datagram(
                     .conn
                     .close(true, 0x102, b"HTTP/3 initialization failed")
                     .ok();
-                return;
+                return None;
             }
         }
     }
@@ -1091,6 +1198,7 @@ fn handle_datagram(
         });
     }
     pump_outgoing(session);
+    None
 }
 
 fn drain_h3_events(session: &mut Session, app: &AppRuntime) -> Vec<CompletedRequest> {
@@ -1602,8 +1710,14 @@ pub fn install_shutdown_handler() -> Result<Arc<AtomicBool>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{take_rate_limit_token, PendingRequest};
-    use std::time::{Duration, Instant};
+    use super::{
+        take_rate_limit_token, PendingRequest, ProtectionState, RequestGuard, WorkloadClass,
+    };
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn token_bucket_enforces_burst_and_refills() {
@@ -1666,5 +1780,209 @@ mod tests {
         assert_eq!(request.authority, "example.com");
         assert_eq!(request.path, "/x");
         assert_eq!(request.query.as_deref(), Some("a=1"));
+    }
+
+    fn test_app() -> super::AppRuntime {
+        let config = crate::config::Config {
+            listen: "127.0.0.1:8443".parse().unwrap(),
+            plain_listen: "127.0.0.1:8080".parse().unwrap(),
+            http1_secure_enabled: false,
+            http1_plain_enabled: false,
+            http2_secure_enabled: false,
+            http2_plain_enabled: false,
+            cert_path: Default::default(),
+            key_path: Default::default(),
+            max_request_body_bytes: 1024,
+            max_static_file_bytes: 1024,
+            timeouts: Default::default(),
+            limits: Default::default(),
+            rate_limit: Default::default(),
+            log_filter: "info".into(),
+            default_host: None,
+            virtual_hosts: vec![],
+            controllers: Default::default(),
+        };
+        super::AppRuntime {
+            controllers: crate::controllers::ControllerRuntime::new(&config.controllers, 1024)
+                .unwrap(),
+            protection: Rc::new(RefCell::new(ProtectionState::new(&config.rate_limit))),
+            config: Rc::new(config),
+        }
+    }
+
+    #[test]
+    fn local_rejections_do_not_consume_global_tokens() {
+        for case in 0..6 {
+            let mut app = test_app();
+            let config = Rc::get_mut(&mut app.config).unwrap();
+            match case {
+                0 => config.limits.max_inflight_requests = 0,
+                1 => config.limits.max_inflight_requests_per_ip = 0,
+                2 => config.limits.max_inflight_requests_per_host = 0,
+                3 => config.limits.max_inflight_controller_requests = 0,
+                4 => config.limits.max_tracked_client_ips = 0,
+                5 => {
+                    config.rate_limit.burst_per_ip = 0;
+                    config.rate_limit.requests_per_second_per_ip = 0;
+                }
+                _ => unreachable!(),
+            }
+            let before = app.protection.borrow().global_tokens;
+            let error = app
+                .acquire_request("127.0.0.1".parse().unwrap(), "example.com")
+                .err()
+                .unwrap();
+            use super::AdmissionError::*;
+            assert!(matches!(
+                (case, error),
+                (0, GlobalCapacity)
+                    | (1, PerIpCapacity)
+                    | (2, PerHostCapacity)
+                    | (3, WorkloadCapacity)
+                    | (4, ClientTableFull)
+                    | (5, RateLimited)
+            ));
+            assert_eq!(app.protection.borrow().global_tokens, before);
+            assert_eq!(app.protection.borrow().active_requests, 0);
+        }
+    }
+
+    #[test]
+    fn admitted_requests_consume_global_tokens_and_preserve_global_rejection_counter() {
+        let mut app = test_app();
+        let config = Rc::get_mut(&mut app.config).unwrap();
+        config.rate_limit.global_requests_per_second = 0;
+        app.protection.borrow_mut().global_tokens = 1.0;
+        let first = app
+            .acquire_request("127.0.0.1".parse().unwrap(), "example.com")
+            .unwrap();
+        assert_eq!(app.protection.borrow().global_tokens, 0.0);
+        assert!(matches!(
+            app.acquire_request("127.0.0.2".parse().unwrap(), "example.com"),
+            Err(super::AdmissionError::GlobalRateLimited)
+        ));
+        assert_eq!(app.protection.borrow().counters.global_rate_limited, 1);
+        assert_eq!(app.protection.borrow().active_requests, 1);
+        drop(first);
+        assert_eq!(app.protection.borrow().active_requests, 0);
+    }
+
+    #[test]
+    fn retry_tokens_authenticate_peer_cid_and_expire() {
+        let mut tokens = super::RetryTokens::new().unwrap();
+        let peer = "127.0.0.1:4444".parse().unwrap();
+        let cid = [1; quiche::MAX_CONN_ID_LEN];
+        let token = tokens.mint(peer, &cid, b"original");
+        assert_eq!(
+            tokens.validate(peer, &cid, &token).unwrap().as_ref(),
+            b"original"
+        );
+        assert!(tokens
+            .validate("127.0.0.2:4444".parse().unwrap(), &cid, &token)
+            .is_none());
+        assert!(tokens
+            .validate("127.0.0.1:4445".parse().unwrap(), &cid, &token)
+            .is_none());
+        assert!(tokens
+            .validate(peer, &[2; quiche::MAX_CONN_ID_LEN], &token)
+            .is_none());
+        let mut tampered = token.clone();
+        tampered[8] ^= 1;
+        assert!(tokens.validate(peer, &cid, &tampered).is_none());
+        assert!(tokens.validate(peer, &cid, b"short").is_none());
+        tokens.started -= Duration::from_secs(11);
+        assert!(tokens.validate(peer, &cid, &token).is_none());
+    }
+
+    fn initial_packet(version: u32, cid: &[u8], token: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0xc0];
+        packet.extend_from_slice(&version.to_be_bytes());
+        packet.push(cid.len() as u8);
+        packet.extend_from_slice(cid);
+        packet.push(8);
+        packet.extend_from_slice(b"clientid");
+        assert!(token.len() < 64);
+        packet.push(token.len() as u8);
+        packet.extend_from_slice(token);
+        // Zero packet length makes recv fail after a valid token is admitted.
+        packet.resize(1200, 0);
+        packet
+    }
+
+    #[test]
+    fn stateless_admission_and_invalid_initial_release_connection_slots() {
+        let app = test_app();
+        let peer = "127.0.0.1:4444".parse().unwrap();
+        let local = app.config.listen;
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        let h3 = quiche::h3::Config::new().unwrap();
+        let tokens = super::RetryTokens::new().unwrap();
+        let mut sessions = Default::default();
+        let mut aliases = Default::default();
+        let (tx, _rx) = futures::channel::mpsc::channel(1);
+        let mut handle = |packet| {
+            super::handle_datagram(
+                packet,
+                peer,
+                local,
+                &mut config,
+                &h3,
+                &mut sessions,
+                &mut aliases,
+                &app,
+                tx.clone(),
+                &tokens,
+            )
+        };
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_config.set_application_protos(&[b"h3"]).unwrap();
+        let mut client = quiche::connect(
+            Some("example.com"),
+            &quiche::ConnectionId::from_ref(b"clientid"),
+            peer,
+            local,
+            &mut client_config,
+        )
+        .unwrap();
+        let mut initial = vec![0; super::QUIC_PACKET_BUFFER];
+        let (written, _) = client.send(&mut initial).unwrap();
+        initial.truncate(written);
+        assert!(handle(initial[..1199].to_vec()).is_none());
+        let mut negotiation = handle(initial_packet(0x1a2a3a4a, b"original", b"")).unwrap();
+        assert_eq!(
+            quiche::Header::from_slice(&mut negotiation, quiche::MAX_CONN_ID_LEN)
+                .unwrap()
+                .ty,
+            quiche::Type::VersionNegotiation
+        );
+        let mut retry = handle(initial).unwrap();
+        let retry_header = quiche::Header::from_slice(&mut retry, quiche::MAX_CONN_ID_LEN).unwrap();
+        assert_eq!(retry_header.ty, quiche::Type::Retry);
+        assert!(app.protection.borrow().clients.is_empty());
+        let cid = retry_header.scid.as_ref();
+        let token = retry_header.token.unwrap();
+        client
+            .recv(
+                &mut retry,
+                quiche::RecvInfo {
+                    from: local,
+                    to: peer,
+                },
+            )
+            .unwrap();
+        let mut retried = vec![0; super::QUIC_PACKET_BUFFER];
+        let (written, _) = client.send(&mut retried).unwrap();
+        retried.truncate(written);
+        let echoed = quiche::Header::from_slice(&mut retried, quiche::MAX_CONN_ID_LEN).unwrap();
+        assert_eq!(echoed.dcid.as_ref(), cid);
+        assert_eq!(echoed.token.as_ref().unwrap(), &token);
+        assert!(handle(initial_packet(quiche::PROTOCOL_VERSION, cid, b"invalid")).is_none());
+        assert!(app.protection.borrow().clients.is_empty());
+        assert!(handle(initial_packet(quiche::PROTOCOL_VERSION, cid, &token)).is_none());
+        assert!(sessions.is_empty());
+        assert!(aliases.is_empty());
+        let state = app.protection.borrow();
+        assert_eq!(state.active_quic_connections, 0);
+        assert_eq!(state.clients[&peer.ip()].quic_connections, 0);
     }
 }

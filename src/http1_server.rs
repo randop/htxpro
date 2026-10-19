@@ -685,10 +685,13 @@ fn parse_request_head(bytes: &[u8], max_body_bytes: usize, max_header_bytes: usi
         );
     }
     let content_length = match headers.get("content-length") {
-        Some(value) => match value.parse::<usize>() {
-            Ok(length) => length,
-            Err(_) => return HeadParse::Reject(400, "invalid Content-Length"),
-        },
+        Some(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            match value.parse::<usize>() {
+                Ok(length) => length,
+                Err(_) => return HeadParse::Reject(400, "invalid Content-Length"),
+            }
+        }
+        Some(_) => return HeadParse::Reject(400, "invalid Content-Length"),
         None => 0,
     };
     if content_length > max_body_bytes {
@@ -751,6 +754,7 @@ fn reason_phrase(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        409 => "Conflict",
         413 => "Content Too Large",
         414 => "URI Too Long",
         417 => "Expectation Failed",
@@ -762,5 +766,50 @@ fn reason_phrase(status: u16) -> &'static str {
         503 => "Service Unavailable",
         505 => "HTTP Version Not Supported",
         _ => "Response",
+    }
+}
+
+#[cfg(test)]
+mod content_length_tests {
+    use super::{parse_request_head, HeadParse};
+
+    #[test]
+    fn rejects_invalid_content_lengths_and_overflow() {
+        for value in [
+            "",
+            "+1",
+            "-1",
+            "1 0",
+            "1\t0",
+            "1.0",
+            "１",
+            "184467440737095516160",
+        ] {
+            let request =
+                format!("POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: {value}\r\n\r\n");
+            assert!(
+                matches!(
+                    parse_request_head(request.as_bytes(), usize::MAX, 4096),
+                    HeadParse::Reject(400, _)
+                ),
+                "accepted {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_digits_and_defaults_to_zero_without_header() {
+        for (header, expected) in [
+            ("Content-Length: 0012\r\n", 12),
+            ("Content-Length: 0\r\n", 0),
+            ("", 0),
+        ] {
+            let request = format!("POST / HTTP/1.1\r\nHost: example.com\r\n{header}\r\n");
+            let HeadParse::Complete(head) = parse_request_head(request.as_bytes(), 1024, 4096)
+            else {
+                panic!("rejected valid header");
+            };
+            assert_eq!(head.content_length, expected);
+        }
     }
 }
