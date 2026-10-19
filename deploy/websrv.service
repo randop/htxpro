@@ -1,0 +1,28 @@
+[Unit]
+Description=websrv io_uring HTTP/3, HTTP/2, HTTPS/1.1, and cleartext HTTP/1.1 server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=websrv
+Group=websrv
+WorkingDirectory=/opt/websrv
+ExecStart=/opt/websrv/bin/websrv --config /opt/websrv/config.yaml
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6
+# Do not deny io_uring_setup/io_uring_enter/io_uring_register in seccomp.
+# Runtime starts with IoUringDriver only and intentionally fails if setup is blocked.
+
+[Install]
+WantedBy=multi-user.target
