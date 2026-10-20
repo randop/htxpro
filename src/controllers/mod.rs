@@ -88,7 +88,7 @@ impl ControllerRuntime {
             }
 
             let mut response = match route.handler.as_str() {
-                "health" | "status" | "metrics" | "echo" => {
+                "health" | "status" | "metrics" | "echo" | "whoami" => {
                     core::handle(
                         &route.handler,
                         request.clone(),

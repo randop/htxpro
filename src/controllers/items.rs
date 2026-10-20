@@ -160,6 +160,7 @@ mod tests {
             headers: HashMap::new(),
             body: body.to_vec(),
             body_too_large: false,
+            auth: None,
         };
         let params = id
             .map(|id| HashMap::from([("id".into(), id.into())]))

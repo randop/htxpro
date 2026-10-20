@@ -12,6 +12,7 @@ mod http1_server;
 mod http2_server;
 mod http3_server;
 mod http_types;
+mod security;
 mod static_site;
 
 use std::path::PathBuf;

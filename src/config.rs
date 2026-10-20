@@ -1,6 +1,6 @@
 use std::{
-    collections::HashSet,
-    net::SocketAddr,
+    collections::{BTreeMap, HashSet},
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
 };
 
@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use http_validation::validate_header_value;
 use serde::Deserialize;
 
-const DEFAULT_BODY_LIMIT: usize = 1 * 1024 * 1024;
+const DEFAULT_BODY_LIMIT: usize = 1024 * 1024;
 const DEFAULT_STATIC_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -44,9 +44,11 @@ struct RawConfig {
     log_filter: String,
     #[serde(default)]
     default_host: Option<String>,
+    #[serde(default)]
+    security: Option<SecurityConfig>,
     virtual_hosts: Vec<VirtualHostConfig>,
     #[serde(default)]
-    controllers: std::collections::BTreeMap<String, ControllerConfig>,
+    controllers: BTreeMap<String, ControllerConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,8 +70,58 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     pub log_filter: String,
     pub default_host: Option<String>,
+    pub security: Option<SecurityConfig>,
     pub virtual_hosts: Vec<VirtualHostConfig>,
-    pub controllers: std::collections::BTreeMap<String, ControllerConfig>,
+    pub controllers: BTreeMap<String, ControllerConfig>,
+}
+
+/// Global authentication settings. Named modules are referenced by virtual
+/// hosts; multiple modules may be configured, but only `oauth2_workos` is
+/// implemented by this build.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityConfig {
+    #[serde(default = "default_session_cookie")]
+    pub cookie_name: String,
+    #[serde(default = "default_cookie_secure")]
+    pub cookie_secure: bool,
+    #[serde(default = "default_session_ttl_seconds")]
+    pub session_ttl_seconds: u64,
+    #[serde(default = "default_state_ttl_seconds")]
+    pub state_ttl_seconds: u64,
+    pub session_secret: String,
+    pub modules: BTreeMap<String, SecurityModuleConfig>,
+}
+
+/// Configuration for one named security module. Fields are shared by module
+/// kinds so unknown YAML keys and unsupported `type` values are rejected
+/// during configuration loading.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityModuleConfig {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    #[serde(default = "default_authorization_endpoint")]
+    pub authorization_endpoint: String,
+    #[serde(default = "default_token_endpoint")]
+    pub token_endpoint: String,
+    #[serde(default = "default_oauth_provider")]
+    pub provider: String,
+    #[serde(default = "default_oauth_scopes")]
+    pub scopes: Vec<String>,
+    #[serde(default = "default_oauth_http_timeout_ms")]
+    pub http_timeout_ms: u64,
+}
+
+/// A virtual host may require one named security module. The same setting
+/// applies to static sites and controller route tables.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostSecurityConfig {
+    pub module: String,
 }
 
 /// Deadlines in milliseconds. These are request/phase budgets, not a global
@@ -169,6 +221,9 @@ pub struct VirtualHostConfig {
     /// Names a Rust controller route table declared under `controllers`.
     #[serde(default)]
     pub controller: Option<String>,
+    /// Optional named security module guarding this host.
+    #[serde(default)]
+    pub security: Option<HostSecurityConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -229,6 +284,37 @@ fn default_index() -> String {
 }
 fn default_cache_control() -> String {
     "public, max-age=60".to_owned()
+}
+fn default_session_cookie() -> String {
+    "htxpro_session".to_owned()
+}
+fn default_cookie_secure() -> bool {
+    true
+}
+fn default_session_ttl_seconds() -> u64 {
+    3_600
+}
+fn default_state_ttl_seconds() -> u64 {
+    600
+}
+fn default_authorization_endpoint() -> String {
+    "https://api.workos.com/user_management/authorize".to_owned()
+}
+fn default_token_endpoint() -> String {
+    "https://api.workos.com/user_management/authenticate".to_owned()
+}
+fn default_oauth_provider() -> String {
+    "authkit".to_owned()
+}
+fn default_oauth_scopes() -> Vec<String> {
+    vec![
+        "openid".to_owned(),
+        "profile".to_owned(),
+        "email".to_owned(),
+    ]
+}
+fn default_oauth_http_timeout_ms() -> u64 {
+    10_000
 }
 
 impl Config {
@@ -379,8 +465,8 @@ impl Config {
                     route.method
                 );
                 validate_route_pattern(&route.path)?;
-                anyhow::ensure!(matches!(route.handler.as_str(), "health" | "status" | "metrics" | "echo" | "items"),
-                    "unknown handler {:?}; supported handlers are health, status, metrics, echo, items", route.handler);
+                anyhow::ensure!(matches!(route.handler.as_str(), "health" | "status" | "metrics" | "echo" | "items" | "whoami"),
+                    "unknown handler {:?}; supported handlers are health, status, metrics, echo, items, whoami", route.handler);
                 anyhow::ensure!(
                     route_keys.insert((method, route.path.clone())),
                     "duplicate route {:?} {:?} in controller {controller_name:?}",
@@ -388,6 +474,26 @@ impl Config {
                     route.path
                 );
             }
+        }
+
+        for vhost in &raw.virtual_hosts {
+            if let Some(host_security) = &vhost.security {
+                let security = raw.security.as_ref().with_context(|| {
+                    format!(
+                        "virtual host {:?} configures security but no top-level 'security' section exists",
+                        vhost.host
+                    )
+                })?;
+                anyhow::ensure!(
+                    security.modules.contains_key(&host_security.module),
+                    "virtual host {:?} references unknown security module {:?}",
+                    vhost.host,
+                    host_security.module
+                );
+            }
+        }
+        if let Some(security) = &raw.security {
+            validate_security(security)?;
         }
 
         Ok(Self {
@@ -406,6 +512,7 @@ impl Config {
             rate_limit: raw.rate_limit,
             log_filter: raw.log_filter,
             default_host: raw.default_host,
+            security: raw.security,
             virtual_hosts: raw.virtual_hosts,
             controllers: raw.controllers,
         })
@@ -436,6 +543,245 @@ impl Config {
             })
         })
     }
+}
+
+/// Parsed absolute HTTP(S) URL used by security module endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedHttpUrl {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    pub path_and_query: String,
+}
+
+pub(crate) fn parse_http_url(input: &str) -> Result<ParsedHttpUrl> {
+    anyhow::ensure!(
+        !input
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace()),
+        "URL contains whitespace or control characters"
+    );
+    anyhow::ensure!(
+        input.is_ascii(),
+        "URL must be ASCII; percent-encode non-ASCII components"
+    );
+    let (scheme, rest) = input
+        .split_once("://")
+        .context("URL must include an http:// or https:// scheme")?;
+    let scheme = scheme.to_ascii_lowercase();
+    anyhow::ensure!(
+        matches!(scheme.as_str(), "http" | "https"),
+        "URL scheme must be http or https"
+    );
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let boundary = rest.find(['/', '?', '#']);
+    let (authority, path_and_query) = match boundary {
+        Some(index) if rest[index..].starts_with('/') => (&rest[..index], &rest[index..]),
+        Some(_) => anyhow::bail!("URL must include a path starting with '/'"),
+        None => (rest, "/"),
+    };
+    anyhow::ensure!(!authority.is_empty(), "URL host must not be empty");
+    anyhow::ensure!(!authority.contains('@'), "URL userinfo is not supported");
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let (host, rest) = inner
+            .split_once(']')
+            .context("invalid bracketed IPv6 host in URL")?;
+        let port = match rest {
+            "" => default_port,
+            rest => {
+                let value = rest
+                    .strip_prefix(':')
+                    .context("unexpected characters after bracketed IPv6 host")?;
+                parse_port(value)?
+            }
+        };
+        (host.to_owned(), port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        anyhow::ensure!(
+            !host.contains(':'),
+            "IPv6 URL hosts must be enclosed in brackets"
+        );
+        (host.to_owned(), parse_port(port)?)
+    } else {
+        (authority.to_owned(), default_port)
+    };
+    anyhow::ensure!(!host.is_empty(), "URL host must not be empty");
+    anyhow::ensure!(
+        !host
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace()),
+        "URL host contains whitespace or control characters"
+    );
+    anyhow::ensure!(
+        host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b':' | b'*')
+        }),
+        "URL host contains invalid characters"
+    );
+    anyhow::ensure!(
+        path_and_query.starts_with('/'),
+        "URL path must start with '/'"
+    );
+    anyhow::ensure!(
+        !path_and_query.contains('#'),
+        "URL fragments are not supported"
+    );
+    Ok(ParsedHttpUrl {
+        scheme,
+        host,
+        port,
+        path_and_query: path_and_query.to_owned(),
+    })
+}
+
+fn parse_port(value: &str) -> Result<u16> {
+    anyhow::ensure!(
+        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+        "URL port must be numeric"
+    );
+    let port = value.parse::<u16>().context("URL port is out of range")?;
+    anyhow::ensure!(port != 0, "URL port must not be zero");
+    Ok(port)
+}
+
+fn validate_security(security: &SecurityConfig) -> Result<()> {
+    anyhow::ensure!(
+        is_http_token(&security.cookie_name),
+        "security.cookie_name must be a valid HTTP cookie name"
+    );
+    anyhow::ensure!(
+        security.cookie_secure
+            || !(security.cookie_name.starts_with("__Host-")
+                || security.cookie_name.starts_with("__Secure-")),
+        "security.cookie_name uses a secure prefix, which requires cookie_secure: true"
+    );
+    anyhow::ensure!(
+        security.session_secret.len() >= 32,
+        "security.session_secret must contain at least 32 bytes of entropy"
+    );
+    anyhow::ensure!(
+        (60..=31_536_000).contains(&security.session_ttl_seconds),
+        "security.session_ttl_seconds must be between 60 and 31536000 seconds"
+    );
+    anyhow::ensure!(
+        (30..=3_600).contains(&security.state_ttl_seconds),
+        "security.state_ttl_seconds must be between 30 and 3600 seconds"
+    );
+    anyhow::ensure!(
+        !security.modules.is_empty(),
+        "security.modules must define at least one module"
+    );
+    for (name, module) in &security.modules {
+        anyhow::ensure!(
+            !name.trim().is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '_' | '.')),
+            "security module names must be non-empty ASCII identifiers"
+        );
+        match module.kind.as_str() {
+            "oauth2_workos" => validate_workos_module(name, module)?,
+            other => anyhow::bail!(
+                "security module {name:?} has unsupported type {other:?}; supported types are: oauth2_workos"
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn validate_workos_module(name: &str, module: &SecurityModuleConfig) -> Result<()> {
+    anyhow::ensure!(
+        !module.client_id.trim().is_empty(),
+        "security module {name:?} client_id must not be empty"
+    );
+    anyhow::ensure!(
+        !module.client_secret.trim().is_empty(),
+        "security module {name:?} client_secret must not be empty"
+    );
+    let redirect = parse_http_url(&module.redirect_uri)
+        .with_context(|| format!("invalid redirect_uri for security module {name:?}"))?;
+    anyhow::ensure!(
+        !redirect.path_and_query.contains('?'),
+        "security module {name:?} redirect_uri must not contain a query string"
+    );
+    anyhow::ensure!(
+        redirect.path_and_query != "/",
+        "security module {name:?} redirect_uri must include a non-root callback path"
+    );
+    let authorization = parse_http_url(&module.authorization_endpoint)
+        .with_context(|| format!("invalid authorization_endpoint for security module {name:?}"))?;
+    ensure_secure_endpoint(name, "authorization_endpoint", &authorization)?;
+    anyhow::ensure!(
+        !authorization.path_and_query.contains('#'),
+        "security module {name:?} authorization_endpoint must not contain a fragment"
+    );
+    let token = parse_http_url(&module.token_endpoint)
+        .with_context(|| format!("invalid token_endpoint for security module {name:?}"))?;
+    ensure_secure_endpoint(name, "token_endpoint", &token)?;
+    anyhow::ensure!(
+        !token.path_and_query.contains('?'),
+        "security module {name:?} token_endpoint must not contain a query string"
+    );
+    anyhow::ensure!(
+        !module.provider.is_empty()
+            && !module
+                .provider
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace()),
+        "security module {name:?} provider must not be empty or contain whitespace"
+    );
+    for scope in &module.scopes {
+        anyhow::ensure!(
+            !scope.is_empty()
+                && !scope
+                    .chars()
+                    .any(|character| character.is_control() || character.is_whitespace()),
+            "security module {name:?} scopes must be non-empty tokens without whitespace"
+        );
+    }
+    anyhow::ensure!(
+        (100..=120_000).contains(&module.http_timeout_ms),
+        "security module {name:?} http_timeout_ms must be between 100 and 120000 milliseconds"
+    );
+    Ok(())
+}
+
+fn ensure_secure_endpoint(module_name: &str, field: &str, endpoint: &ParsedHttpUrl) -> Result<()> {
+    anyhow::ensure!(
+        endpoint.scheme == "https" || is_loopback_host(&endpoint.host),
+        "security module {module_name:?} {field} must use https unless it targets a loopback host"
+    );
+    Ok(())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn validate_rate_limit(rate_limit: &RateLimitConfig) -> Result<()> {
@@ -681,29 +1027,154 @@ mod tests {
 #[cfg(test)]
 mod protection_config_tests {
     use super::{
-        validate_limits, validate_rate_limit, validate_timeouts, LimitConfig, RateLimitConfig,
-        TimeoutConfig,
+        parse_http_url, validate_limits, validate_rate_limit, validate_security, validate_timeouts,
+        LimitConfig, RateLimitConfig, SecurityConfig, SecurityModuleConfig, TimeoutConfig,
     };
+    use std::collections::BTreeMap;
+
+    fn security_config() -> SecurityConfig {
+        let mut modules = BTreeMap::new();
+        modules.insert(
+            "workos".to_owned(),
+            SecurityModuleConfig {
+                kind: "oauth2_workos".to_owned(),
+                client_id: "client_123".to_owned(),
+                client_secret: "secret".to_owned(),
+                redirect_uri: "https://app.example.test/_htxpro/auth/workos/callback".to_owned(),
+                authorization_endpoint: "https://api.workos.com/user_management/authorize"
+                    .to_owned(),
+                token_endpoint: "https://api.workos.com/user_management/authenticate".to_owned(),
+                provider: "authkit".to_owned(),
+                scopes: vec!["openid".to_owned(), "email".to_owned()],
+                http_timeout_ms: 10_000,
+            },
+        );
+        SecurityConfig {
+            cookie_name: "htxpro_session".to_owned(),
+            cookie_secure: true,
+            session_ttl_seconds: 3_600,
+            state_ttl_seconds: 600,
+            session_secret: "0123456789abcdef0123456789abcdef".to_owned(),
+            modules,
+        }
+    }
 
     #[test]
     fn default_protection_settings_are_valid() {
         validate_timeouts(&TimeoutConfig::default()).unwrap();
         validate_limits(&LimitConfig::default()).unwrap();
         validate_rate_limit(&RateLimitConfig::default()).unwrap();
+        validate_security(&security_config()).unwrap();
     }
 
     #[test]
     fn timeout_and_limit_validation_rejects_zero_values() {
-        let mut timeouts = TimeoutConfig::default();
-        timeouts.request_process_ms = 0;
+        let timeouts = TimeoutConfig {
+            request_process_ms: 0,
+            ..Default::default()
+        };
         assert!(validate_timeouts(&timeouts).is_err());
 
-        let mut limits = LimitConfig::default();
-        limits.max_inflight_requests = 0;
+        let limits = LimitConfig {
+            max_inflight_requests: 0,
+            ..Default::default()
+        };
         assert!(validate_limits(&limits).is_err());
 
-        let mut rate_limit = RateLimitConfig::default();
-        rate_limit.global_burst = 0;
+        let rate_limit = RateLimitConfig {
+            global_burst: 0,
+            ..Default::default()
+        };
         assert!(validate_rate_limit(&rate_limit).is_err());
+    }
+
+    #[test]
+    fn security_validation_rejects_weak_or_unsupported_settings() {
+        let mut config = security_config();
+        config.session_secret = "too-short".to_owned();
+        assert!(validate_security(&config).is_err());
+
+        let mut config = security_config();
+        config.cookie_name = "__Host-htxpro_session".to_owned();
+        config.cookie_secure = false;
+        assert!(validate_security(&config).is_err());
+        config.cookie_secure = true;
+        validate_security(&config).unwrap();
+
+        let mut config = security_config();
+        config.modules.get_mut("workos").unwrap().kind = "oauth2_unknown".to_owned();
+        assert!(validate_security(&config).is_err());
+
+        let mut config = security_config();
+        config.modules.get_mut("workos").unwrap().redirect_uri =
+            "https://app.example.test/callback?next=/".to_owned();
+        assert!(validate_security(&config).is_err());
+
+        let mut config = security_config();
+        config.modules.get_mut("workos").unwrap().redirect_uri =
+            "https://app.example.test/".to_owned();
+        assert!(validate_security(&config).is_err());
+
+        let mut config = security_config();
+        config.modules.get_mut("workos").unwrap().token_endpoint = "file:///etc/passwd".to_owned();
+        assert!(validate_security(&config).is_err());
+
+        let mut config = security_config();
+        config.modules.get_mut("workos").unwrap().token_endpoint =
+            "http://api.workos.com/user_management/authenticate".to_owned();
+        assert!(validate_security(&config).is_err());
+
+        let mut config = security_config();
+        config.modules.get_mut("workos").unwrap().token_endpoint =
+            "http://127.0.0.1:9/user_management/authenticate".to_owned();
+        validate_security(&config).unwrap();
+    }
+
+    #[test]
+    fn security_config_parses_yaml_defaults_and_type_key() {
+        let parsed: SecurityConfig = yaml_serde::from_str(
+            r#"
+session_secret: "0123456789abcdef0123456789abcdef"
+modules:
+  workos:
+    type: "oauth2_workos"
+    client_id: "client_123"
+    client_secret: "secret"
+    redirect_uri: "https://app.example.test/_htxpro/auth/workos/callback"
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.cookie_name, "htxpro_session");
+        assert!(parsed.cookie_secure);
+        assert_eq!(parsed.session_ttl_seconds, 3_600);
+        assert_eq!(parsed.state_ttl_seconds, 600);
+        let workos = &parsed.modules["workos"];
+        assert_eq!(workos.kind, "oauth2_workos");
+        assert_eq!(workos.provider, "authkit");
+        assert_eq!(workos.http_timeout_ms, 10_000);
+        assert_eq!(workos.scopes, ["openid", "profile", "email"]);
+        validate_security(&parsed).unwrap();
+    }
+
+    #[test]
+    fn http_url_parser_handles_ports_ipv6_and_query_strings() {
+        let parsed = parse_http_url("https://[::1]:8443/callback?next=%2F").unwrap();
+        assert_eq!(parsed.scheme, "https");
+        assert_eq!(parsed.host, "::1");
+        assert_eq!(parsed.port, 8443);
+        assert_eq!(parsed.path_and_query, "/callback?next=%2F");
+
+        assert!(parse_http_url("https://user@example.test/").is_err());
+        assert!(parse_http_url("file:///etc/passwd").is_err());
+        assert!(parse_http_url("https://example.test").is_ok());
+        assert_eq!(
+            parse_http_url("https://*.tenant.example.test/callback")
+                .unwrap()
+                .host,
+            "*.tenant.example.test"
+        );
+        assert!(parse_http_url("https://example.test/caf\u{e9}").is_err());
+        assert!(parse_http_url("https://example.test:0/").is_err());
+        assert!(parse_http_url("https://example.test?query=1").is_err());
     }
 }
