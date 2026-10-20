@@ -484,11 +484,36 @@ impl Config {
                         vhost.host
                     )
                 })?;
+                let module = security
+                    .modules
+                    .get(&host_security.module)
+                    .with_context(|| {
+                        format!(
+                            "virtual host {:?} references unknown security module {:?}",
+                            vhost.host, host_security.module
+                        )
+                    })?;
+                let redirect = parse_http_url(&module.redirect_uri).with_context(|| {
+                    format!(
+                        "invalid redirect_uri for security module {:?} on virtual host {:?}",
+                        host_security.module, vhost.host
+                    )
+                })?;
+                // URL parsing removes IPv6 brackets; authority normalization expects them.
+                let redirect_authority = if redirect.host.contains(':') {
+                    format!("[{}]", redirect.host)
+                } else {
+                    redirect.host
+                };
+                let redirect_host = normalize_authority(&redirect_authority);
                 anyhow::ensure!(
-                    security.modules.contains_key(&host_security.module),
-                    "virtual host {:?} references unknown security module {:?}",
-                    vhost.host,
-                    host_security.module
+                    std::iter::once(&vhost.host)
+                        .chain(vhost.aliases.iter())
+                        .any(|pattern| host_matches(pattern, &redirect_host)),
+                    "security module {:?} redirect_uri host {:?} does not match virtual host {:?} or its aliases",
+                    host_security.module,
+                    redirect_host,
+                    vhost.host
                 );
             }
         }
@@ -1154,6 +1179,104 @@ modules:
         assert_eq!(workos.http_timeout_ms, 10_000);
         assert_eq!(workos.scopes, ["openid", "profile", "email"]);
         validate_security(&parsed).unwrap();
+    }
+
+    #[test]
+    fn protected_host_redirect_validation_runs_during_config_loading() {
+        let cases = [
+            (
+                "app.example.test",
+                "other.example.test",
+                "https://APP.EXAMPLE.TEST.:8443/callback",
+                true,
+            ),
+            (
+                "app.example.test",
+                "login.example.test",
+                "https://login.example.test/callback",
+                true,
+            ),
+            (
+                "*.example.test",
+                "other.test",
+                "https://tenant.example.test/callback",
+                true,
+            ),
+            (
+                "app.test",
+                "*.example.test",
+                "https://tenant.example.test/callback",
+                true,
+            ),
+            ("[::1]", "localhost", "http://[::1]:8080/callback", true),
+            (
+                "app.example.test",
+                "other.example.test",
+                "https://unrelated.test/callback",
+                false,
+            ),
+            (
+                "*.example.test",
+                "other.test",
+                "https://example.test/callback",
+                false,
+            ),
+            (
+                "*.example.test",
+                "other.test",
+                "https://badexample.test/callback",
+                false,
+            ),
+            ("app.example.test", "other.test", "not-a-url", false),
+        ];
+        for (index, (host, alias, redirect, valid)) in cases.into_iter().enumerate() {
+            let yaml = format!(
+                r#"
+virtual_hosts:
+  - host: {host:?}
+    aliases: [{alias:?}]
+    controller: api
+    security:
+      module: workos
+controllers:
+  api:
+    routes:
+      - {{ method: GET, path: /, handler: health }}
+security:
+  session_secret: "0123456789abcdef0123456789abcdef"
+  modules:
+    workos:
+      type: oauth2_workos
+      client_id: client_test
+      client_secret: secret
+      redirect_uri: {redirect:?}
+"#
+            );
+            let path = std::env::temp_dir().join(format!(
+                "htxpro-redirect-{}-{}-{index}.yaml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::write(&path, yaml).unwrap();
+            let result = super::Config::load(&path);
+            std::fs::remove_file(&path).unwrap();
+            if valid {
+                result.unwrap();
+            } else {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains("redirect_uri"), "{error}");
+                assert!(error.contains("workos"), "{error}");
+                assert!(error.contains(host), "{error}");
+                if redirect == "not-a-url" {
+                    assert!(error.contains("scheme"), "{error}");
+                } else {
+                    assert!(error.contains("does not match"), "{error}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ monoio-rustls = "0.4.0"
 signal-hook = "0.3"
 futures = "0.3"
 mime_guess = "2"
-monoio = { version = "0.2.4", default-features = false, features = ["iouring", "utils"] }
+monoio = { version = "0.2.4", default-features = false, features = ["iouring", "utils", "sync"] }
 percent-encoding = "2"
 quiche = "0.24.6"
 ring = "0.17"
