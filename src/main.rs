@@ -14,6 +14,7 @@ mod http3_server;
 mod http_types;
 mod security;
 mod static_site;
+mod tls;
 
 use std::path::PathBuf;
 
@@ -26,7 +27,8 @@ fn main() -> Result<()> {
     init_tracing(&config.log_filter)?;
     info!(path = %config_path.display(), "loaded YAML configuration");
 
-    let quic_config = http3_server::make_quic_config(&config)?;
+    let tls_material = tls::TlsMaterial::load(&config.cert_paths, &config.key_paths)?;
+    let quic_config = http3_server::make_quic_config(&config, &tls_material)?;
     let shutdown = http3_server::install_shutdown_handler()?;
 
     // Intentionally select only Monoio's io_uring driver. There is no fusion/legacy
@@ -36,7 +38,12 @@ fn main() -> Result<()> {
         .build()
         .context("could not initialize the mandatory io_uring runtime; check kernel support and seccomp policy")?;
 
-    runtime.block_on(http3_server::serve(config, quic_config, shutdown))
+    runtime.block_on(http3_server::serve(
+        config,
+        tls_material,
+        quic_config,
+        shutdown,
+    ))
 }
 
 fn init_tracing(log_filter: &str) -> Result<()> {

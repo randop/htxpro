@@ -798,28 +798,80 @@ enum ServerEvent {
     Shutdown,
 }
 
-pub fn make_quic_config(config: &Config) -> Result<quiche::Config> {
-    let mut quic = quiche::Config::new(quiche::PROTOCOL_VERSION)
-        .context("could not create QUIC configuration")?;
+struct QuicCertificateChain {
+    leaf: boring::x509::X509,
+    intermediates: Vec<boring::x509::X509>,
+    key: boring::pkey::PKey<boring::pkey::Private>,
+}
+
+fn make_quic_tls_builder(
+    material: &crate::tls::TlsMaterial,
+) -> Result<boring::ssl::SslContextBuilder> {
+    use boring::ssl::{NameType, SelectCertError, SslContextBuilder, SslMethod};
+
+    let mut builder = SslContextBuilder::new(SslMethod::tls())
+        .context("could not create BoringSSL context for QUIC")?;
+
+    let mut chains = Vec::with_capacity(material.chains().len());
+    for chain in material.chains() {
+        let leaf = boring::x509::X509::from_der(chain.cert_chain[0].as_ref())
+            .context("could not parse TLS leaf certificate for QUIC")?;
+        let intermediates = chain.cert_chain[1..]
+            .iter()
+            .map(|der| {
+                boring::x509::X509::from_der(der.as_ref())
+                    .context("could not parse TLS intermediate certificate for QUIC")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let key = boring::pkey::PKey::private_key_from_der(chain.key.secret_der())
+            .context("could not parse TLS private key for QUIC")?;
+        chains.push(QuicCertificateChain {
+            leaf,
+            intermediates,
+            key,
+        });
+    }
+
+    let default = material.default_chain_index();
+    builder
+        .set_certificate(&chains[default].leaf)
+        .context("could not configure the default QUIC certificate")?;
+    builder
+        .set_private_key(&chains[default].key)
+        .context("could not configure the default QUIC private key")?;
+    builder
+        .check_private_key()
+        .context("default QUIC certificate and private key do not match")?;
+
+    let chains = Arc::new(chains);
+    let index = material.index().clone();
+    builder.set_select_certificate_callback(move |mut hello| {
+        let chain = &chains[index.select(hello.servername(NameType::HOST_NAME))];
+        let ssl = hello.ssl_mut();
+        ssl.set_certificate(&chain.leaf)
+            .map_err(|_| SelectCertError::ERROR)?;
+        for intermediate in &chain.intermediates {
+            ssl.add_chain_cert(intermediate)
+                .map_err(|_| SelectCertError::ERROR)?;
+        }
+        ssl.set_private_key(&chain.key)
+            .map_err(|_| SelectCertError::ERROR)?;
+        Ok(())
+    });
+
+    Ok(builder)
+}
+
+pub fn make_quic_config(
+    config: &Config,
+    material: &crate::tls::TlsMaterial,
+) -> Result<quiche::Config> {
+    let tls_builder = make_quic_tls_builder(material)?;
+    let mut quic =
+        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls_builder)
+            .context("could not create QUIC configuration")?;
     quic.set_application_protos(&[b"h3"])
         .context("could not configure HTTP/3 ALPN")?;
-    let cert_path = config
-        .cert_path
-        .to_str()
-        .context("tls_cert path is not valid UTF-8")?;
-    let key_path = config
-        .key_path
-        .to_str()
-        .context("tls_key path is not valid UTF-8")?;
-    quic.load_cert_chain_from_pem_file(cert_path)
-        .with_context(|| {
-            format!(
-                "could not load certificate chain {}",
-                config.cert_path.display()
-            )
-        })?;
-    quic.load_priv_key_from_pem_file(key_path)
-        .with_context(|| format!("could not load private key {}", config.key_path.display()))?;
     quic.set_max_idle_timeout(config.timeouts.keep_alive_idle_ms);
     quic.set_max_recv_udp_payload_size(QUIC_PACKET_BUFFER);
     quic.set_max_send_udp_payload_size(QUIC_PACKET_BUFFER);
@@ -837,6 +889,7 @@ pub fn make_quic_config(config: &Config) -> Result<quiche::Config> {
 
 pub async fn serve(
     config: Config,
+    tls_material: crate::tls::TlsMaterial,
     mut quic_config: quiche::Config,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -872,8 +925,7 @@ pub async fn serve(
 
     if secure_http_enabled {
         let tls_config = crate::http1_server::make_tls_config(
-            &app.config.cert_path,
-            &app.config.key_path,
+            &tls_material,
             http1_secure_enabled,
             http2_secure_enabled,
         )?;
@@ -1827,8 +1879,8 @@ mod tests {
             http1_plain_enabled: false,
             http2_secure_enabled: false,
             http2_plain_enabled: false,
-            cert_path: Default::default(),
-            key_path: Default::default(),
+            cert_paths: Default::default(),
+            key_paths: Default::default(),
             max_request_body_bytes: 1024,
             max_static_file_bytes: 1024,
             timeouts: Default::default(),

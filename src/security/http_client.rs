@@ -1,17 +1,14 @@
 //! Minimal outbound HTTP/1.1 client for provider token exchange. Connections
 //! and TLS I/O are driven by Monoio's mandatory io_uring runtime; endpoints are
-//! resolved at startup and refreshed on a helper thread after connection failures
-//! so request-time DNS does not block the reactor.
+//! resolved once during startup so request-time DNS does not block the reactor.
 
 use std::{
-    future::Future,
     net::{SocketAddr, ToSocketAddrs},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context, Result};
-use futures::{channel::oneshot, future::Shared, FutureExt};
 use monoio::{
     io::{AsyncReadRent, AsyncWriteRentExt},
     net::TcpStream,
@@ -34,32 +31,25 @@ pub struct Endpoint {
     host: String,
     port: u16,
     path_and_query: String,
-    addresses: Arc<Mutex<AddressCache>>,
-}
-
-type DnsLookup = Shared<oneshot::Receiver<std::result::Result<Vec<SocketAddr>, String>>>;
-
-#[derive(Debug)]
-struct AddressCache {
     addresses: Vec<SocketAddr>,
-    refresh: Option<DnsLookup>,
-}
-
-fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("could not resolve security endpoint host {host:?}:{port}"))?
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        !addresses.is_empty(),
-        "security endpoint host {host:?} resolved to no addresses"
-    );
-    Ok(addresses)
 }
 
 impl Endpoint {
     pub fn resolve(url: &crate::config::ParsedHttpUrl) -> Result<Self> {
-        let addresses = resolve_addresses(&url.host, url.port)?;
+        let addresses = (url.host.as_str(), url.port)
+            .to_socket_addrs()
+            .with_context(|| {
+                format!(
+                    "could not resolve security endpoint host {:?}:{}",
+                    url.host, url.port
+                )
+            })?
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            !addresses.is_empty(),
+            "security endpoint host {:?} resolved to no addresses",
+            url.host
+        );
         Ok(Self {
             scheme: if url.scheme == "https" {
                 Scheme::Https
@@ -69,38 +59,8 @@ impl Endpoint {
             host: url.host.clone(),
             port: url.port,
             path_and_query: url.path_and_query.clone(),
-            addresses: Arc::new(Mutex::new(AddressCache {
-                addresses,
-                refresh: None,
-            })),
+            addresses,
         })
-    }
-
-    fn refresh_addresses(&self) -> Result<DnsLookup> {
-        let mut cache = self.addresses.lock().unwrap();
-        if let Some(lookup) = &cache.refresh {
-            return Ok(lookup.clone());
-        }
-        let (sender, receiver) = oneshot::channel();
-        let host = self.host.clone();
-        let port = self.port;
-        let shared_cache = self.addresses.clone();
-        // Keep one lookup per endpoint in flight, even if a caller times out.
-        std::thread::Builder::new()
-            .name("security-dns".to_owned())
-            .spawn(move || {
-                let result = resolve_addresses(&host, port).map_err(|error| format!("{error:#}"));
-                let mut cache = shared_cache.lock().unwrap();
-                if let Ok(addresses) = &result {
-                    cache.addresses = addresses.clone();
-                }
-                cache.refresh = None;
-                let _ = sender.send(result);
-            })
-            .context("could not start security endpoint DNS resolver")?;
-        let lookup = receiver.shared();
-        cache.refresh = Some(lookup.clone());
-        Ok(lookup)
     }
 
     fn host_header(&self) -> String {
@@ -150,8 +110,7 @@ pub async fn post_json(
     request.extend_from_slice(body);
 
     let exchange = async {
-        // Reserve budget for a DNS refresh/retry and for TLS and response I/O.
-        let tcp = connect(endpoint, timeout / 3).await?;
+        let tcp = connect(endpoint).await?;
         match endpoint.scheme {
             Scheme::Http => {
                 let mut tcp = tcp;
@@ -175,53 +134,12 @@ pub async fn post_json(
     parse_response(&response)
 }
 
-async fn connect(endpoint: &Endpoint, connection_budget: Duration) -> Result<TcpStream> {
-    let addresses = endpoint.addresses.lock().unwrap().addresses.clone();
-    let attempt_timeout =
-        |count: usize| connection_budget / u32::try_from(count.max(1)).unwrap_or(u32::MAX);
-    if let Ok(stream) = connect_addresses(
-        &addresses,
-        attempt_timeout(addresses.len()),
-        TcpStream::connect_addr,
-    )
-    .await
-    {
-        return Ok(stream);
-    }
-
-    let addresses = endpoint
-        .refresh_addresses()?
-        .await
-        .context("security endpoint DNS resolver stopped")?
-        .map_err(anyhow::Error::msg)?;
-    connect_addresses(
-        &addresses,
-        attempt_timeout(addresses.len()),
-        TcpStream::connect_addr,
-    )
-    .await
-}
-
-async fn connect_addresses<T, F, Fut>(
-    addresses: &[SocketAddr],
-    attempt_timeout: Duration,
-    mut dial: F,
-) -> Result<T>
-where
-    F: FnMut(SocketAddr) -> Fut,
-    Fut: Future<Output = std::io::Result<T>>,
-{
+async fn connect(endpoint: &Endpoint) -> Result<TcpStream> {
     let mut last_error = None;
-    for address in addresses {
-        match monoio::time::timeout(attempt_timeout, dial(*address)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(error)) => last_error = Some(error),
-            Err(_) => {
-                last_error = Some(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("connection to security endpoint address {address} timed out"),
-                ));
-            }
+    for address in &endpoint.addresses {
+        match TcpStream::connect_addr(*address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
         }
     }
     Err(last_error
@@ -399,152 +317,7 @@ fn decode_chunked(body: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        chunked_body_len, complete_response_len, connect_addresses, decode_chunked,
-        make_tls_config, post_json, Endpoint,
-    };
-    use std::{
-        future::Future,
-        io::{Read, Write},
-        net::TcpListener,
-        time::Duration,
-    };
-
-    fn run(future: impl Future<Output = ()>) {
-        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
-            .expect("security client tests require io_uring")
-            .block_on(future);
-    }
-
-    #[test]
-    fn stalled_address_times_out_and_next_address_succeeds() {
-        run(async {
-            let addresses = [
-                "127.0.0.1:1".parse().unwrap(),
-                "127.0.0.1:2".parse().unwrap(),
-            ];
-            let connected = connect_addresses(
-                &addresses,
-                Duration::from_millis(10),
-                |address| async move {
-                    if address.port() == 1 {
-                        futures::future::pending().await
-                    } else {
-                        Ok(address)
-                    }
-                },
-            )
-            .await
-            .unwrap();
-            assert_eq!(connected, addresses[1]);
-        });
-    }
-
-    #[test]
-    fn connection_errors_report_the_final_attempt() {
-        run(async {
-            let addresses = [
-                "127.0.0.1:1".parse().unwrap(),
-                "127.0.0.1:2".parse().unwrap(),
-            ];
-            let error = connect_addresses(
-                &addresses,
-                Duration::from_millis(10),
-                |address| async move {
-                    if address.port() == 2 {
-                        futures::future::pending::<std::io::Result<()>>().await
-                    } else {
-                        Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
-                    }
-                },
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(
-                error.downcast_ref::<std::io::Error>().unwrap().kind(),
-                std::io::ErrorKind::TimedOut
-            );
-            assert!(format!("{error:#}").contains("127.0.0.1:2"));
-
-            let error = connect_addresses(&addresses, Duration::from_millis(10), |_| async {
-                Err::<(), _>(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
-            })
-            .await
-            .unwrap_err();
-            assert_eq!(
-                error.downcast_ref::<std::io::Error>().unwrap().kind(),
-                std::io::ErrorKind::ConnectionRefused
-            );
-        });
-    }
-
-    #[test]
-    fn token_exchange_refreshes_stale_addresses_and_preserves_overall_timeout() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = crate::config::parse_http_url(&format!(
-            "http://{}/token",
-            listener.local_addr().unwrap()
-        ))
-        .unwrap();
-        let endpoint = Endpoint::resolve(&url).unwrap();
-        // Port zero cannot have a TCP listener; model an obsolete cached answer.
-        endpoint.addresses.lock().unwrap().addresses = vec!["127.0.0.1:0".parse().unwrap()];
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0; 1024];
-            while !request.ends_with(b"\r\n\r\n{}") {
-                let read = stream.read(&mut buffer).unwrap();
-                assert_ne!(read, 0);
-                request.extend_from_slice(&buffer[..read]);
-            }
-            assert!(request.starts_with(b"POST /token HTTP/1.1\r\n"));
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
-                .unwrap();
-            let (stream, _) = listener.accept().unwrap();
-            let mut buffer = [0; 1024];
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            // Wait until the timed-out client closes the connection.
-            let mut stream = stream;
-            while stream.read(&mut buffer).unwrap() != 0 {}
-        });
-        run(async {
-            let tls = make_tls_config().unwrap();
-            // Exercise the cross-thread DNS wakeup from a spawned reactor task.
-            let cloned_endpoint = endpoint.clone();
-            let tls_clone = tls.clone();
-            let (status, body) = monoio::spawn(async move {
-                post_json(&cloned_endpoint, &tls_clone, b"{}", Duration::from_secs(2))
-                    .await
-                    .unwrap()
-            })
-            .await;
-            assert_eq!(status, 200);
-            assert_eq!(body, b"{}");
-            assert_eq!(
-                endpoint.addresses.lock().unwrap().addresses,
-                vec![url_address(&url)]
-            );
-            // The server accepts but sends no response on the second connection.
-            let error = post_json(&endpoint, &tls, b"{}", Duration::from_millis(30))
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains("request timed out"), "{error:#}");
-        });
-        server.join().unwrap();
-    }
-
-    fn url_address(url: &crate::config::ParsedHttpUrl) -> std::net::SocketAddr {
-        std::net::SocketAddr::new(url.host.parse().unwrap(), url.port)
-    }
+    use super::{chunked_body_len, complete_response_len, decode_chunked};
 
     #[test]
     fn content_length_responses_stop_at_the_declared_body() {
