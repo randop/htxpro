@@ -58,6 +58,9 @@ virtual_hosts:
 
   - host: "api.example.test"
     controller: "public_api"
+    # Uncomment to require authentication through a named security module:
+    # security:
+    #   module: "workos"
 
 controllers:
   public_api:
@@ -74,6 +77,9 @@ controllers:
       - method: "POST"
         path: "/echo"
         handler: "echo"
+      - method: "GET"
+        path: "/v1/whoami"
+        handler: "whoami"
       - method: "GET"
         path: "/v1/items"
         handler: "items"
@@ -95,3 +101,32 @@ controllers:
       - method: "DELETE"
         path: "/v1/items/{id}"
         handler: "items"
+
+# Optional host authentication. Named modules may be referenced by any static
+# or controller virtual host through:
+#
+#   security:
+#     module: "workos"
+#
+# Multiple named module instances are supported. This build implements only
+# the WorkOS OAuth2 authorization-code module. The callback path below is
+# derived from redirect_uri and is handled before static/controller dispatch.
+# Register the exact redirect URI in the WorkOS dashboard.
+#
+# security:
+#   cookie_name: "htxpro_session"
+#   cookie_secure: true          # set false only for local plain-HTTP testing
+#   session_secret: "replace-with-at-least-32-random-bytes"
+#   session_ttl_seconds: 3600
+#   state_ttl_seconds: 600
+#   modules:
+#     workos:
+#       type: "oauth2_workos"
+#       client_id: "client_123456789"
+#       client_secret: "sk_example_123456789"
+#       redirect_uri: "https://api.example.test/_htxpro/auth/workos/callback"
+#       authorization_endpoint: "https://api.workos.com/user_management/authorize"
+#       token_endpoint: "https://api.workos.com/user_management/authenticate"
+#       provider: "authkit"
+#       scopes: ["openid", "profile", "email"]
+#       http_timeout_ms: 10000

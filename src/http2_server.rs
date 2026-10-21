@@ -17,7 +17,7 @@ use tracing::debug;
 
 use crate::{
     http3_server::AppRuntime,
-    http_types::{HttpRequest, HttpResponse},
+    http_types::{is_safe_header, HttpRequest, HttpResponse},
 };
 
 struct ActiveStreamGuard(Rc<Cell<usize>>);
@@ -236,6 +236,7 @@ async fn handle_request(
         headers,
         body,
         body_too_large: false,
+        auth: None,
     };
     let app_for_dispatch = app.clone();
     let response_work = Box::pin(async move {
@@ -323,6 +324,18 @@ async fn send_response(
         {
             builder = builder.header(header::CACHE_CONTROL, cache_control.as_str());
         }
+    }
+    for (name, value) in &response.headers {
+        if !is_safe_header(name, value) {
+            continue;
+        }
+        let (Ok(name), Ok(value)) = (
+            header::HeaderName::from_bytes(name.as_bytes()),
+            header::HeaderValue::from_str(value),
+        ) else {
+            continue;
+        };
+        builder = builder.header(name, value);
     }
     // HTTP/2 forbids connection-specific fields; only end the stream, never the connection.
     let head_only = is_head || response.head_only;

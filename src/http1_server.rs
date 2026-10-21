@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     http3_server::{AppRuntime, RequestGuard, TcpConnectionGuard},
-    http_types::{HttpRequest, HttpResponse},
+    http_types::{is_safe_header, HttpRequest, HttpResponse},
 };
 
 const SOCKET_READ_BYTES: usize = 16 * 1024;
@@ -409,6 +409,7 @@ where
                 headers: head.headers,
                 body,
                 body_too_large: false,
+                auth: None,
             };
             let is_head = request.method.eq_ignore_ascii_case("HEAD");
             let close_after = head.close_after;
@@ -568,6 +569,11 @@ where
             .any(|ch| ch.is_control() && ch != '\t')
         {
             headers.push_str(&format!("cache-control: {cache_control}\r\n"));
+        }
+    }
+    for (name, value) in &response.headers {
+        if is_safe_header(name, value) {
+            headers.push_str(&format!("{name}: {value}\r\n"));
         }
     }
     headers.push_str("\r\n");
@@ -753,6 +759,7 @@ fn reason_phrase(status: u16) -> &'static str {
         206 => "Partial Content",
         301 => "Moved Permanently",
         302 => "Found",
+        303 => "See Other",
         304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
@@ -769,6 +776,7 @@ fn reason_phrase(status: u16) -> &'static str {
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         505 => "HTTP Version Not Supported",
         _ => "Response",

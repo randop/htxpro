@@ -22,6 +22,18 @@ pub async fn handle(
             }),
         ),
         "metrics" => HttpResponse::json(200, metrics),
+        "whoami" => match &request.auth {
+            Some(identity) => HttpResponse::json(
+                200,
+                json!({
+                    "module": identity.module,
+                    "subject": identity.subject,
+                    "email": identity.email,
+                    "name": identity.name,
+                }),
+            ),
+            None => HttpResponse::error(401, "request has no authenticated identity"),
+        },
         "echo" => echo(request, max_body_bytes).await,
         _ => HttpResponse::error(404, "unknown controller action"),
     }

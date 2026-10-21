@@ -28,7 +28,8 @@ use tracing::{debug, info, warn};
 use crate::{
     config::Config,
     controllers::ControllerRuntime,
-    http_types::{HttpRequest, HttpResponse},
+    http_types::{is_safe_header, HttpRequest, HttpResponse},
+    security::SecurityRuntime,
     static_site,
 };
 
@@ -113,6 +114,7 @@ impl RetryTokens {
 pub(crate) struct AppRuntime {
     config: Rc<Config>,
     controllers: ControllerRuntime,
+    security: SecurityRuntime,
     protection: Rc<RefCell<ProtectionState>>,
 }
 
@@ -473,7 +475,15 @@ impl AppRuntime {
             return HttpResponse::error(421, "no virtual host is configured for this authority");
         };
 
-        match (&vhost.static_site, &vhost.controller) {
+        let protected = vhost.security.is_some();
+        let request = match self.security.guard(vhost, request).await {
+            crate::security::SecurityOutcome::Allow(request) => request,
+            crate::security::SecurityOutcome::Respond(response) => {
+                return protect_response(response);
+            }
+        };
+
+        let response = match (&vhost.static_site, &vhost.controller) {
             (Some(site), None) => {
                 static_site::serve(site, &request, self.config.max_static_file_bytes).await
             }
@@ -483,6 +493,11 @@ impl AppRuntime {
                     .await
             }
             _ => HttpResponse::error(500, "invalid virtual-host configuration"),
+        };
+        if protected {
+            protect_response(response)
+        } else {
+            response
         }
     }
 
@@ -678,6 +693,14 @@ impl AppRuntime {
     }
 }
 
+fn protect_response(mut response: HttpResponse) -> HttpResponse {
+    response.cache_control = Some("private, no-store".to_owned());
+    response
+        .headers
+        .push(("vary".to_owned(), "Cookie".to_owned()));
+    response
+}
+
 struct PendingRequest {
     method: String,
     authority: String,
@@ -701,6 +724,7 @@ impl PendingRequest {
             headers: self.headers,
             body: self.body,
             body_too_large: self.body_too_large,
+            auth: None,
         };
         (request, self.guard, self.cancel_token)
     }
@@ -711,6 +735,7 @@ struct OutgoingResponse {
     status: u16,
     content_type: String,
     cache_control: Option<String>,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
     offset: usize,
     head_only: bool,
@@ -828,6 +853,7 @@ pub async fn serve(
         u64::try_from(config.limits.max_header_bytes).unwrap_or(u64::MAX),
     );
     let controllers = ControllerRuntime::new(&config.controllers, config.max_request_body_bytes)?;
+    let security = SecurityRuntime::new(config.security.as_ref())?;
     let http1_secure_enabled = config.http1_secure_enabled;
     let http1_plain_enabled = config.http1_plain_enabled;
     let http2_secure_enabled = config.http2_secure_enabled;
@@ -840,6 +866,7 @@ pub async fn serve(
     let app = AppRuntime {
         config: Rc::new(config),
         controllers,
+        security,
         protection,
     };
 
@@ -1112,9 +1139,7 @@ fn handle_datagram(
         }
     };
 
-    let Some(session) = sessions.get_mut(&connection_id) else {
-        return None;
-    };
+    let session = sessions.get_mut(&connection_id)?;
     let recv_info = quiche::RecvInfo {
         from: peer,
         to: local_addr,
@@ -1205,11 +1230,8 @@ fn handle_datagram(
 fn drain_h3_events(session: &mut Session, app: &AppRuntime) -> Vec<CompletedRequest> {
     let mut completed = Vec::new();
 
-    loop {
-        let polled = match session.h3.as_mut() {
-            Some(h3) => h3.poll(&mut session.conn),
-            None => break,
-        };
+    while let Some(h3) = session.h3.as_mut() {
+        let polled = h3.poll(&mut session.conn);
         let (stream_id, event) = match polled {
             Ok(value) => value,
             Err(quiche::h3::Error::Done) => break,
@@ -1247,7 +1269,14 @@ fn drain_h3_events(session: &mut Session, app: &AppRuntime) -> Vec<CompletedRequ
                             query = request_query;
                         }
                         name if !name.starts_with(':') => {
-                            headers.insert(name.to_owned(), value);
+                            let separator = if name == "cookie" { "; " } else { ", " };
+                            headers
+                                .entry(name.to_owned())
+                                .and_modify(|existing: &mut String| {
+                                    existing.push_str(separator);
+                                    existing.push_str(&value);
+                                })
+                                .or_insert(value);
                         }
                         _ => {}
                     }
@@ -1324,11 +1353,8 @@ fn drain_h3_events(session: &mut Session, app: &AppRuntime) -> Vec<CompletedRequ
             quiche::h3::Event::Data => {
                 let mut buffer = vec![0u8; 16 * 1024];
                 let mut oversized = false;
-                loop {
-                    let read_result = match session.h3.as_mut() {
-                        Some(h3) => h3.recv_body(&mut session.conn, stream_id, &mut buffer),
-                        None => break,
-                    };
+                while let Some(h3) = session.h3.as_mut() {
+                    let read_result = h3.recv_body(&mut session.conn, stream_id, &mut buffer);
                     match read_result {
                         Ok(0) | Err(quiche::h3::Error::Done) => break,
                         Ok(read) => {
@@ -1415,6 +1441,7 @@ fn queue_response(
         status: response.status,
         content_type: response.content_type,
         cache_control: response.cache_control,
+        headers: response.headers,
         body: response.body,
         offset: 0,
         head_only: response.head_only,
@@ -1441,6 +1468,7 @@ fn pump_outgoing(session: &mut Session) {
             status_code,
             content_type,
             cache_control,
+            response_headers,
             body_len,
             head_only,
             headers_sent,
@@ -1450,6 +1478,7 @@ fn pump_outgoing(session: &mut Session) {
                 front.status,
                 front.content_type.clone(),
                 front.cache_control.clone(),
+                front.headers.clone(),
                 front.body.len(),
                 front.head_only,
                 front.headers_sent,
@@ -1479,6 +1508,14 @@ fn pump_outgoing(session: &mut Session) {
                     b"cache-control",
                     cache_control.as_bytes(),
                 ));
+            }
+            for (name, value) in &response_headers {
+                if is_safe_header(name, value) {
+                    headers.push(quiche::h3::Header::new(
+                        name.to_ascii_lowercase().as_bytes(),
+                        value.as_bytes(),
+                    ));
+                }
             }
             let result = match session.h3.as_mut() {
                 Some(h3) => h3.send_response(&mut session.conn, stream_id, &headers, no_body),
@@ -1799,12 +1836,14 @@ mod tests {
             rate_limit: Default::default(),
             log_filter: "info".into(),
             default_host: None,
+            security: None,
             virtual_hosts: vec![],
             controllers: Default::default(),
         };
         super::AppRuntime {
             controllers: crate::controllers::ControllerRuntime::new(&config.controllers, 1024)
                 .unwrap(),
+            security: crate::security::SecurityRuntime::new(None).unwrap(),
             protection: Rc::new(RefCell::new(ProtectionState::new(&config.rate_limit))),
             config: Rc::new(config),
         }
