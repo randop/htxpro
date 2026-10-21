@@ -521,11 +521,34 @@ impl Config {
                         vhost.host
                     )
                 })?;
+                let module = security
+                    .modules
+                    .get(&host_security.module)
+                    .with_context(|| {
+                        format!(
+                            "virtual host {:?} references unknown security module {:?}",
+                            vhost.host, host_security.module
+                        )
+                    })?;
+                let redirect = parse_http_url(&module.redirect_uri).with_context(|| {
+                    format!(
+                        "invalid redirect_uri for security module {:?}",
+                        host_security.module
+                    )
+                })?;
+                let redirect_host = normalize_authority(&if redirect.host.contains(':') {
+                    format!("[{}]", redirect.host)
+                } else {
+                    redirect.host
+                });
                 anyhow::ensure!(
-                    security.modules.contains_key(&host_security.module),
-                    "virtual host {:?} references unknown security module {:?}",
-                    vhost.host,
-                    host_security.module
+                    std::iter::once(&vhost.host)
+                        .chain(vhost.aliases.iter())
+                        .any(|pattern| host_matches(pattern, &redirect_host)),
+                    "security module {:?} redirect_uri host {:?} must match virtual host {:?} or one of its aliases",
+                    host_security.module,
+                    redirect_host,
+                    vhost.host
                 );
             }
         }
@@ -1191,6 +1214,111 @@ modules:
         assert_eq!(workos.http_timeout_ms, 10_000);
         assert_eq!(workos.scopes, ["openid", "profile", "email"]);
         validate_security(&parsed).unwrap();
+    }
+
+    fn load_security_config(
+        virtual_hosts: &str,
+        redirect_host: &str,
+    ) -> anyhow::Result<super::Config> {
+        let temp = tempfile::TempDir::new()?;
+        let path = temp.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+security:
+  session_secret: "0123456789abcdef0123456789abcdef"
+  modules:
+    workos:
+      type: oauth2_workos
+      client_id: client_123
+      client_secret: secret
+      redirect_uri: "https://{redirect_host}/callback"
+controllers:
+  api:
+    routes:
+      - {{method: GET, path: /health, handler: health}}
+virtual_hosts:
+{virtual_hosts}
+"#
+            ),
+        )?;
+        super::Config::load(&path)
+    }
+
+    #[test]
+    fn security_redirect_host_must_match_protected_host_or_alias() {
+        for (host, alias, redirect, accepted) in [
+            (
+                "app.example.test",
+                "www.example.test",
+                "app.example.test",
+                true,
+            ),
+            (
+                "app.example.test",
+                "www.example.test",
+                "WWW.EXAMPLE.TEST.:8443",
+                true,
+            ),
+            ("*.example.test", "alias.test", "app.example.test", true),
+            ("app.example.test", "*.alias.test", "www.alias.test", true),
+            ("[::1]", "localhost", "[::1]:8443", true),
+            (
+                "app.example.test",
+                "www.example.test",
+                "other.example.test",
+                false,
+            ),
+            ("*.example.test", "alias.test", "example.test", false),
+            ("*.example.test", "alias.test", "badexample.test", false),
+            ("app.example.test", "*.alias.test", "alias.test", false),
+        ] {
+            let hosts = format!(
+                "  - host: '{host}'\n    aliases: ['{alias}']\n    controller: api\n    security: {{module: workos}}"
+            );
+            let result = load_security_config(&hosts, redirect);
+            if accepted {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("redirect_uri host"), "{error}");
+                assert!(error.contains(host), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn security_redirect_is_checked_for_every_protected_host() {
+        let hosts = r#"
+  - host: app.example.test
+    controller: api
+    security: {module: workos}
+  - host: other.example.test
+    controller: api
+    security: {module: workos}
+"#;
+        let error = load_security_config(hosts, "app.example.test")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("redirect_uri host"), "{error}");
+        assert!(error.contains("other.example.test"), "{error}");
+    }
+
+    #[test]
+    fn security_unknown_module_error_is_preserved() {
+        let hosts = r#"
+  - host: app.example.test
+    controller: api
+    security: {module: missing}
+"#;
+        let error = load_security_config(hosts, "app.example.test")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "virtual host \"app.example.test\" references unknown security module \"missing\""
+        );
     }
 
     #[test]

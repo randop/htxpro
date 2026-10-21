@@ -288,16 +288,23 @@ pub(crate) struct SniIndex {
 
 impl SniIndex {
     fn insert(&mut self, name: &str, chain_index: usize) {
-        if name.starts_with("*.") {
-            if !self
-                .wildcard
-                .iter()
-                .any(|(pattern, index)| pattern == name && *index == chain_index)
-            {
+        let kept_chain_index = if name.starts_with("*.") {
+            if let Some((_, index)) = self.wildcard.iter().find(|(pattern, _)| pattern == name) {
+                *index
+            } else {
                 self.wildcard.push((name.to_owned(), chain_index));
+                chain_index
             }
         } else {
-            self.exact.entry(name.to_owned()).or_insert(chain_index);
+            *self.exact.entry(name.to_owned()).or_insert(chain_index)
+        };
+        if kept_chain_index != chain_index {
+            tracing::warn!(
+                name,
+                kept_chain_index,
+                ignored_chain_index = chain_index,
+                "duplicate SNI name; keeping the first certificate chain"
+            );
         }
     }
 
@@ -505,5 +512,40 @@ mod tests {
         assert_eq!(index.select(Some("api.example.com")), 2);
         assert_eq!(index.select(Some("www.example.com")), 1);
         assert_eq!(index.select(Some("example.com")), 0);
+    }
+
+    #[test]
+    fn duplicate_sni_names_keep_first_chain_and_warn_only_on_conflicts() {
+        use std::io::{Read, Seek};
+
+        let mut log_file = tempfile::tempfile().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(log_file.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut index = SniIndex::default();
+            for name in ["api.example.com", "*.example.com"] {
+                index.insert(name, 1);
+                index.insert(name, 1);
+                index.insert(name, 2);
+            }
+            assert_eq!(index.select(Some("api.example.com")), 1);
+            assert_eq!(index.select(Some("www.example.com")), 1);
+            assert_eq!(index.len(), 2);
+        });
+        log_file.rewind().unwrap();
+        let mut logs = String::new();
+        log_file.read_to_string(&mut logs).unwrap();
+        assert_eq!(logs.lines().count(), 2, "{logs}");
+        for name in ["api.example.com", "*.example.com"] {
+            assert!(logs.contains(name), "{logs}");
+        }
+        for line in logs.lines() {
+            assert!(line.contains("kept_chain_index=1"), "{line}");
+            assert!(line.contains("ignored_chain_index=2"), "{line}");
+        }
     }
 }
