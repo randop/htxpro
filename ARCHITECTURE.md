@@ -63,7 +63,7 @@ cargo build --release
 ./target/release/htxpro --config ./config.yaml
 ```
 
-The default config path is `config.yaml` in the current working directory. Use `-c` or `--config` to specify another file. Relative certificate and static-root paths are resolved against the directory containing the YAML file. Environment variables do not override YAML settings and `.env` files are not loaded.
+The default config path is `config.yaml` in the current working directory. Use `-c` or `--config` to specify another file. Use `--version` (or `-V`) to print the version and exit, and `--help` (or `-h`) for usage. Relative certificate and static-root paths are resolved against the directory containing the YAML file. Environment variables do not override YAML settings and `.env` files are not loaded.
 
 ### Local HTTP/3 smoke test
 

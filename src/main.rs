@@ -66,9 +66,12 @@ fn config_path_from_args() -> Result<PathBuf> {
             config_path = PathBuf::from(args.next().context("--config requires a path")?);
         } else if arg == "--help" || arg == "-h" {
             println!(
-                "Usage: {} [--config <path>]\n\nOptions:\n  -c, --config <path>  YAML configuration file (default: config.yaml)\n  -h, --help           Show this help message",
+                "Usage: {} [--config <path>]\n\nOptions:\n  -c, --config <path>  YAML configuration file (default: config.yaml)\n  -h, --help           Show this help message\n  -V, --version        Print version information",
                 env!("CARGO_PKG_NAME")
             );
+            std::process::exit(0);
+        } else if arg == "--version" || arg == "-V" {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
         } else if let Some(value) = arg.to_str().and_then(|arg| arg.strip_prefix("--config=")) {
             config_path = PathBuf::from(value);
