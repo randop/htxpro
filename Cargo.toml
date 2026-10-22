@@ -1,14 +1,15 @@
 [package]
 name = "htxpro"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "Linux-only HTTP/3, HTTP/2, and HTTP/1.1 server using a mandatory io_uring runtime, host-based static sites, and modular in-process REST controllers"
 
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+boring = "=5.3.0"
 bytes = "1"
 http = "1"
 monoio-http = "0.3.12"
@@ -16,9 +17,9 @@ monoio-rustls = "0.4.0"
 signal-hook = "0.3"
 futures = "0.3"
 mime_guess = "2"
-monoio = { version = "0.2.4", default-features = false, features = ["iouring", "utils", "sync"] }
+monoio = { version = "0.2.4", default-features = false, features = ["iouring", "utils"] }
 percent-encoding = "2"
-quiche = "0.24.6"
+quiche = { version = "0.30.0", features = ["boringssl-boring-crate"] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
@@ -28,8 +29,12 @@ subtle = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 webpki-roots = "1"
+x509-parser = "0.18"
 yaml_serde = "0.10"
 
+[dev-dependencies]
+rcgen = "0.14"
+tempfile = "3"
 
 [profile.release]
 lto = "thin"

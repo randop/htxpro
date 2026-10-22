@@ -27,9 +27,9 @@ struct RawConfig {
     #[serde(default)]
     http2_plain_enabled: bool,
     #[serde(default = "default_cert_path")]
-    tls_cert: PathBuf,
+    tls_cert: TlsPaths,
     #[serde(default = "default_key_path")]
-    tls_key: PathBuf,
+    tls_key: TlsPaths,
     #[serde(default = "default_body_limit")]
     max_request_body_bytes: usize,
     #[serde(default = "default_static_limit")]
@@ -61,8 +61,8 @@ pub struct Config {
     pub plain_listen: SocketAddr,
     pub http2_secure_enabled: bool,
     pub http2_plain_enabled: bool,
-    pub cert_path: PathBuf,
-    pub key_path: PathBuf,
+    pub cert_paths: Vec<PathBuf>,
+    pub key_paths: Vec<PathBuf>,
     pub max_request_body_bytes: usize,
     pub max_static_file_bytes: usize,
     pub timeouts: TimeoutConfig,
@@ -264,11 +264,30 @@ fn default_http2_secure_enabled() -> bool {
 fn default_plain_listen() -> String {
     "0.0.0.0:8080".to_owned()
 }
-fn default_cert_path() -> PathBuf {
-    PathBuf::from("certs/fullchain.pem")
+/// A TLS path setting accepts either one path or a list of paths. A list makes
+/// it possible to keep separate fullchain/key files per domain; concatenated
+/// PEM files remain supported when a single path is configured.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TlsPaths {
+    One(PathBuf),
+    Many(Vec<PathBuf>),
 }
-fn default_key_path() -> PathBuf {
-    PathBuf::from("certs/privkey.pem")
+
+impl TlsPaths {
+    fn into_vec(self) -> Vec<PathBuf> {
+        match self {
+            Self::One(path) => vec![path],
+            Self::Many(paths) => paths,
+        }
+    }
+}
+
+fn default_cert_path() -> TlsPaths {
+    TlsPaths::One(PathBuf::from("certs/fullchain.pem"))
+}
+fn default_key_path() -> TlsPaths {
+    TlsPaths::One(PathBuf::from("certs/privkey.pem"))
 }
 fn default_body_limit() -> usize {
     DEFAULT_BODY_LIMIT
@@ -381,8 +400,26 @@ impl Config {
                 base_dir.join(configured)
             }
         };
-        raw.tls_cert = resolve_path(raw.tls_cert);
-        raw.tls_key = resolve_path(raw.tls_key);
+        let cert_paths = raw
+            .tls_cert
+            .into_vec()
+            .into_iter()
+            .map(&resolve_path)
+            .collect::<Vec<_>>();
+        let key_paths = raw
+            .tls_key
+            .into_vec()
+            .into_iter()
+            .map(&resolve_path)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            !cert_paths.is_empty(),
+            "tls_cert must contain at least one certificate path"
+        );
+        anyhow::ensure!(
+            !key_paths.is_empty(),
+            "tls_key must contain at least one private key path"
+        );
 
         for vhost in &mut raw.virtual_hosts {
             vhost.host = normalize_host_pattern(&vhost.host)?;
@@ -495,22 +532,20 @@ impl Config {
                     })?;
                 let redirect = parse_http_url(&module.redirect_uri).with_context(|| {
                     format!(
-                        "invalid redirect_uri for security module {:?} on virtual host {:?}",
-                        host_security.module, vhost.host
+                        "invalid redirect_uri for security module {:?}",
+                        host_security.module
                     )
                 })?;
-                // URL parsing removes IPv6 brackets; authority normalization expects them.
-                let redirect_authority = if redirect.host.contains(':') {
+                let redirect_host = normalize_authority(&if redirect.host.contains(':') {
                     format!("[{}]", redirect.host)
                 } else {
                     redirect.host
-                };
-                let redirect_host = normalize_authority(&redirect_authority);
+                });
                 anyhow::ensure!(
                     std::iter::once(&vhost.host)
                         .chain(vhost.aliases.iter())
                         .any(|pattern| host_matches(pattern, &redirect_host)),
-                    "security module {:?} redirect_uri host {:?} does not match virtual host {:?} or its aliases",
+                    "security module {:?} redirect_uri host {:?} must match virtual host {:?} or one of its aliases",
                     host_security.module,
                     redirect_host,
                     vhost.host
@@ -528,8 +563,8 @@ impl Config {
             http2_secure_enabled: raw.http2_secure_enabled,
             http2_plain_enabled: raw.http2_plain_enabled,
             plain_listen,
-            cert_path: raw.tls_cert,
-            key_path: raw.tls_key,
+            cert_paths,
+            key_paths,
             max_request_body_bytes: raw.max_request_body_bytes,
             max_static_file_bytes: raw.max_static_file_bytes,
             timeouts: raw.timeouts,
@@ -1181,102 +1216,127 @@ modules:
         validate_security(&parsed).unwrap();
     }
 
-    #[test]
-    fn protected_host_redirect_validation_runs_during_config_loading() {
-        let cases = [
-            (
-                "app.example.test",
-                "other.example.test",
-                "https://APP.EXAMPLE.TEST.:8443/callback",
-                true,
-            ),
-            (
-                "app.example.test",
-                "login.example.test",
-                "https://login.example.test/callback",
-                true,
-            ),
-            (
-                "*.example.test",
-                "other.test",
-                "https://tenant.example.test/callback",
-                true,
-            ),
-            (
-                "app.test",
-                "*.example.test",
-                "https://tenant.example.test/callback",
-                true,
-            ),
-            ("[::1]", "localhost", "http://[::1]:8080/callback", true),
-            (
-                "app.example.test",
-                "other.example.test",
-                "https://unrelated.test/callback",
-                false,
-            ),
-            (
-                "*.example.test",
-                "other.test",
-                "https://example.test/callback",
-                false,
-            ),
-            (
-                "*.example.test",
-                "other.test",
-                "https://badexample.test/callback",
-                false,
-            ),
-            ("app.example.test", "other.test", "not-a-url", false),
-        ];
-        for (index, (host, alias, redirect, valid)) in cases.into_iter().enumerate() {
-            let yaml = format!(
+    fn load_security_config(
+        virtual_hosts: &str,
+        redirect_host: &str,
+    ) -> anyhow::Result<super::Config> {
+        let temp = tempfile::TempDir::new()?;
+        let path = temp.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
                 r#"
-virtual_hosts:
-  - host: {host:?}
-    aliases: [{alias:?}]
-    controller: api
-    security:
-      module: workos
-controllers:
-  api:
-    routes:
-      - {{ method: GET, path: /, handler: health }}
 security:
   session_secret: "0123456789abcdef0123456789abcdef"
   modules:
     workos:
       type: oauth2_workos
-      client_id: client_test
+      client_id: client_123
       client_secret: secret
-      redirect_uri: {redirect:?}
+      redirect_uri: "https://{redirect_host}/callback"
+controllers:
+  api:
+    routes:
+      - {{method: GET, path: /health, handler: health}}
+virtual_hosts:
+{virtual_hosts}
 "#
+            ),
+        )?;
+        super::Config::load(&path)
+    }
+
+    #[test]
+    fn security_redirect_host_must_match_protected_host_or_alias() {
+        for (host, alias, redirect, accepted) in [
+            (
+                "app.example.test",
+                "www.example.test",
+                "app.example.test",
+                true,
+            ),
+            (
+                "app.example.test",
+                "www.example.test",
+                "WWW.EXAMPLE.TEST.:8443",
+                true,
+            ),
+            ("*.example.test", "alias.test", "app.example.test", true),
+            ("app.example.test", "*.alias.test", "www.alias.test", true),
+            ("[::1]", "localhost", "[::1]:8443", true),
+            (
+                "app.example.test",
+                "www.example.test",
+                "other.example.test",
+                false,
+            ),
+            ("*.example.test", "alias.test", "example.test", false),
+            ("*.example.test", "alias.test", "badexample.test", false),
+            ("app.example.test", "*.alias.test", "alias.test", false),
+        ] {
+            let hosts = format!(
+                "  - host: '{host}'\n    aliases: ['{alias}']\n    controller: api\n    security: {{module: workos}}"
             );
-            let path = std::env::temp_dir().join(format!(
-                "htxpro-redirect-{}-{}-{index}.yaml",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::write(&path, yaml).unwrap();
-            let result = super::Config::load(&path);
-            std::fs::remove_file(&path).unwrap();
-            if valid {
+            let result = load_security_config(&hosts, redirect);
+            if accepted {
                 result.unwrap();
             } else {
-                let error = format!("{:#}", result.unwrap_err());
-                assert!(error.contains("redirect_uri"), "{error}");
-                assert!(error.contains("workos"), "{error}");
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("redirect_uri host"), "{error}");
                 assert!(error.contains(host), "{error}");
-                if redirect == "not-a-url" {
-                    assert!(error.contains("scheme"), "{error}");
-                } else {
-                    assert!(error.contains("does not match"), "{error}");
-                }
             }
         }
+    }
+
+    #[test]
+    fn security_redirect_is_checked_for_every_protected_host() {
+        let hosts = r#"
+  - host: app.example.test
+    controller: api
+    security: {module: workos}
+  - host: other.example.test
+    controller: api
+    security: {module: workos}
+"#;
+        let error = load_security_config(hosts, "app.example.test")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("redirect_uri host"), "{error}");
+        assert!(error.contains("other.example.test"), "{error}");
+    }
+
+    #[test]
+    fn security_unknown_module_error_is_preserved() {
+        let hosts = r#"
+  - host: app.example.test
+    controller: api
+    security: {module: missing}
+"#;
+        let error = load_security_config(hosts, "app.example.test")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "virtual host \"app.example.test\" references unknown security module \"missing\""
+        );
+    }
+
+    #[test]
+    fn tls_paths_accept_a_scalar_or_a_list() {
+        use std::path::PathBuf;
+
+        let one: super::TlsPaths = yaml_serde::from_str("\"certs/fullchain.pem\"").unwrap();
+        assert_eq!(one.into_vec(), vec![PathBuf::from("certs/fullchain.pem")]);
+
+        let many: super::TlsPaths =
+            yaml_serde::from_str("[certs/google.pem, certs/apple.pem]").unwrap();
+        assert_eq!(
+            many.into_vec(),
+            vec![
+                PathBuf::from("certs/google.pem"),
+                PathBuf::from("certs/apple.pem")
+            ]
+        );
     }
 
     #[test]

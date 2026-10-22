@@ -4,6 +4,23 @@ http1_secure_enabled: true
 http1_plain_enabled: true
 http2_secure_enabled: true
 http2_plain_enabled: true
+# Each TLS setting accepts either one path (shown) or a YAML list. A single
+# PEM file may contain one fullchain or several concatenated fullchains; keys
+# may be concatenated or kept in separate files. Leaves are paired with keys
+# by public key, and issuer chains are rebuilt from the supplied certificates.
+#
+# For multiple domains, configure either concatenated files or separate paths:
+# tls_cert:
+#   - "certs/example.com/fullchain.pem"
+#   - "certs/test.com/fullchain.pem"
+# tls_key:
+#   - "certs/example.com/privkey.pem"
+#   - "certs/test.com/privkey.pem"
+#
+# The TLS SNI name selects the chain: exact DNS SAN names (or the CN when a
+# certificate has no DNS SAN) beat wildcards, and a wildcard matches exactly
+# one label. The first chain is the fallback for clients that omit SNI or
+# request an unknown name.
 tls_cert: "certs/fullchain.pem"
 tls_key: "certs/privkey.pem"
 max_request_body_bytes: 1048576

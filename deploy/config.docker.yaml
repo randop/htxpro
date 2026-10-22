@@ -1,4 +1,5 @@
 # Example container config; TLS files must be mounted at the paths below.
+# tls_cert and tls_key also accept YAML lists for separate per-domain files.
 listen: "0.0.0.0:8443" # UDP/QUIC and enabled secure HTTP protocols share the port number.
 http1_secure_enabled: true
 http1_plain_enabled: true

@@ -1,10 +1,8 @@
 //! TLS ALPN dispatch for secure HTTP/2 and HTTP/1.1, plus cleartext HTTP/1.1 and h2c on Monoio io_uring.
 use std::{
     collections::HashMap,
-    fs::File,
-    io::{self, BufReader, Cursor},
+    io::{self, Cursor},
     net::IpAddr,
-    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -26,39 +24,16 @@ use crate::{
 const SOCKET_READ_BYTES: usize = 16 * 1024;
 
 pub fn make_tls_config(
-    cert_path: &Path,
-    key_path: &Path,
+    material: &crate::tls::TlsMaterial,
     http1_secure_enabled: bool,
     http2_secure_enabled: bool,
 ) -> Result<Arc<ServerConfig>> {
-    let mut cert_reader = BufReader::new(
-        File::open(cert_path)
-            .with_context(|| format!("cannot open TLS certificate {}", cert_path.display()))?,
-    );
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("cannot parse TLS certificate chain {}", cert_path.display()))?;
-    anyhow::ensure!(
-        !certs.is_empty(),
-        "TLS certificate chain {} is empty",
-        cert_path.display()
-    );
-
-    let mut key_reader = BufReader::new(
-        File::open(key_path)
-            .with_context(|| format!("cannot open TLS private key {}", key_path.display()))?,
-    );
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .with_context(|| format!("cannot parse TLS private key {}", key_path.display()))?
-        .context("TLS key PEM does not contain a supported private key")?;
-
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .context("no safe TLS protocol versions are available")?
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("TLS certificate and private key do not match or are unsupported")?;
+        .with_cert_resolver(Arc::new(crate::tls::SniCertResolver::new(material)));
     tls.alpn_protocols = [
         (http2_secure_enabled, b"h2".to_vec()),
         (http1_secure_enabled, b"http/1.1".to_vec()),

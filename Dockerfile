@@ -1,9 +1,9 @@
 FROM rust:bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake clang perl pkg-config ca-certificates \
+    build-essential cmake clang libclang-dev perl pkg-config ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY public ./public
 COPY sites ./sites
