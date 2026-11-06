@@ -8,6 +8,7 @@ Type=simple
 User=htxpro
 Group=htxpro
 WorkingDirectory=/opt/htxpro
+EnvironmentFile=-/etc/htxpro/htxpro.env
 ExecStart=/opt/htxpro/bin/htxpro --config /opt/htxpro/config.yaml
 Restart=on-failure
 RestartSec=2
