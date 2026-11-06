@@ -133,7 +133,7 @@ controllers:
 # security:
 #   cookie_name: "htxpro_session"
 #   cookie_secure: true          # set false only for local plain-HTTP testing
-#   session_secret: "replace-with-at-least-32-random-bytes"
+#   session_secret: "${HTXPRO_SESSION_SECRET}" # generate with deploy/generate-session-secret.sh
 #   session_ttl_seconds: 3600
 #   state_ttl_seconds: 600
 #   modules:

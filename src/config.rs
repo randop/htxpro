@@ -352,6 +352,12 @@ impl Config {
                 canonical_config.display()
             )
         })?;
+        if let Some(security) = raw.security.as_mut() {
+            security.session_secret = resolve_session_secret(
+                &security.session_secret,
+                std::env::var("HTXPRO_SESSION_SECRET").ok().as_deref(),
+            )?;
+        }
 
         let listen = raw
             .listen
@@ -704,6 +710,53 @@ fn parse_port(value: &str) -> Result<u16> {
     Ok(port)
 }
 
+const SESSION_SECRET_ENV_REFERENCE: &str = "${HTXPRO_SESSION_SECRET}";
+
+fn resolve_session_secret(value: &str, environment_value: Option<&str>) -> Result<String> {
+    if value != SESSION_SECRET_ENV_REFERENCE {
+        return Ok(value.to_owned());
+    }
+
+    let secret = environment_value.context(
+        "security.session_secret references ${HTXPRO_SESSION_SECRET}, but HTXPRO_SESSION_SECRET is not set",
+    )?;
+    anyhow::ensure!(
+        !secret.is_empty(),
+        "HTXPRO_SESSION_SECRET must not be empty"
+    );
+    Ok(secret.to_owned())
+}
+
+fn validate_session_secret(secret: &str) -> Result<()> {
+    anyhow::ensure!(
+        secret.len() >= 32,
+        "security.session_secret must contain at least 32 bytes"
+    );
+    anyhow::ensure!(
+        secret.trim() == secret,
+        "security.session_secret must not have leading or trailing whitespace"
+    );
+
+    // This exact value was shipped in the public configuration examples. Keep
+    // rejecting it even though it satisfies the length check above.
+    let normalized = secret.to_ascii_lowercase();
+    anyhow::ensure!(
+        ![
+            "replace-with-at-least-32-random-bytes",
+            "change-me-session-secret",
+            "changeme-session-secret",
+            "your-session-secret-here",
+            "replace-this-session-secret",
+            "insert-session-secret-here",
+            "placeholder-session-secret",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(*marker)),
+        "security.session_secret is a published or known placeholder; generate a unique random secret"
+    );
+    Ok(())
+}
+
 fn validate_security(security: &SecurityConfig) -> Result<()> {
     anyhow::ensure!(
         is_http_token(&security.cookie_name),
@@ -715,10 +768,7 @@ fn validate_security(security: &SecurityConfig) -> Result<()> {
                 || security.cookie_name.starts_with("__Secure-")),
         "security.cookie_name uses a secure prefix, which requires cookie_secure: true"
     );
-    anyhow::ensure!(
-        security.session_secret.len() >= 32,
-        "security.session_secret must contain at least 32 bytes of entropy"
-    );
+    validate_session_secret(&security.session_secret)?;
     anyhow::ensure!(
         (60..=31_536_000).contains(&security.session_ttl_seconds),
         "security.session_ttl_seconds must be between 60 and 31536000 seconds"
@@ -1087,8 +1137,9 @@ mod tests {
 #[cfg(test)]
 mod protection_config_tests {
     use super::{
-        parse_http_url, validate_limits, validate_rate_limit, validate_security, validate_timeouts,
-        LimitConfig, RateLimitConfig, SecurityConfig, SecurityModuleConfig, TimeoutConfig,
+        parse_http_url, resolve_session_secret, validate_limits, validate_rate_limit,
+        validate_security, validate_session_secret, validate_timeouts, LimitConfig,
+        RateLimitConfig, SecurityConfig, SecurityModuleConfig, TimeoutConfig,
     };
     use std::collections::BTreeMap;
 
@@ -1146,6 +1197,43 @@ mod protection_config_tests {
             ..Default::default()
         };
         assert!(validate_rate_limit(&rate_limit).is_err());
+    }
+
+    #[test]
+    fn session_secret_validation_rejects_published_and_common_placeholders() {
+        for placeholder in [
+            "replace-with-at-least-32-random-bytes",
+            "REPLACE-WITH-AT-LEAST-32-RANDOM-BYTES",
+            "change-me-session-secret-change-me-session-secret",
+            "your-session-secret-here-your-session-secret-here",
+            "placeholder-session-secret-placeholder-session-secret",
+        ] {
+            assert!(
+                validate_session_secret(placeholder).is_err(),
+                "placeholder unexpectedly accepted: {placeholder}"
+            );
+        }
+
+        assert!(validate_session_secret(&format!(" {}", "a".repeat(32))).is_err());
+        assert!(validate_session_secret(&" ".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn session_secret_environment_reference_requires_a_value() {
+        assert!(resolve_session_secret("${HTXPRO_SESSION_SECRET}", None).is_err());
+        assert!(resolve_session_secret("${HTXPRO_SESSION_SECRET}", Some("")).is_err());
+        assert_eq!(
+            resolve_session_secret("${HTXPRO_SESSION_SECRET}", Some(&"a".repeat(64)))
+                .unwrap(),
+            "a".repeat(64)
+        );
+    }
+
+    #[test]
+    fn security_validation_rejects_published_placeholder_secret() {
+        let mut config = security_config();
+        config.session_secret = "replace-with-at-least-32-random-bytes".to_owned();
+        assert!(validate_security(&config).is_err());
     }
 
     #[test]

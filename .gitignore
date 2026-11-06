@@ -57,6 +57,8 @@ criterion/
 # ------------------------------------------------------------------------------
 .env
 .env.*
+htxpro.env
+htxpro.env.*
 !.env.example
 *.pem
 *.key

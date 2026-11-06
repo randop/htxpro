@@ -177,7 +177,7 @@ default_host: "example.test"
 security:
   cookie_name: "htxpro_session"
   cookie_secure: true
-  session_secret: "replace-with-at-least-32-random-bytes"
+  session_secret: "${HTXPRO_SESSION_SECRET}"
   session_ttl_seconds: 3600
   state_ttl_seconds: 600
   modules:
@@ -260,7 +260,7 @@ controllers:
 | `default_host` | Optional exact host (or alias) served for otherwise-unmatched authorities |
 | `security.cookie_name` | Host-only session cookie name; defaults to `htxpro_session` |
 | `security.cookie_secure` | Adds `Secure` to session/state cookies; defaults to `true`. Disable only for local plain-HTTP testing |
-| `security.session_secret` | HMAC key for signed session and OAuth state cookies; at least 32 bytes, keep private |
+| `security.session_secret` | HMAC key for signed session and OAuth state cookies; use `${HTXPRO_SESSION_SECRET}` to read it from the process environment; at least 32 bytes and never commit it |
 | `security.session_ttl_seconds` | Lifetime of an authenticated session cookie |
 | `security.state_ttl_seconds` | Lifetime of the short-lived OAuth state/PKCE cookie |
 | `security.modules.<name>` | Named security module instance; multiple instances may be configured |
@@ -297,7 +297,7 @@ The WorkOS module implements the OAuth2 authorization-code flow with PKCE (`S256
 
 Unauthenticated requests that are not `GET`/`HEAD`, or that do not prefer HTML on a controller host, receive `401` instead of a login redirect. This keeps API clients from receiving an HTML login page. Expired/tampered cookies are treated as unauthenticated, and callback errors return `400`, `401`, or `502` while clearing the state cookie. Responses handled by the auth gate or served on a protected host are marked `Cache-Control: private, no-store` with `Vary: Cookie`, so shared caches do not serve authenticated content or login states to other clients. Session lifetime is `security.session_ttl_seconds`; sessions are not centrally revocable before expiry. The module authenticates users only; application-level authorization, roles, and per-route policy remain the controller's responsibility.
 
-`redirect_uri` must be registered exactly with WorkOS and normally uses the same public hostname as the protected virtual host. Proxies or alternate public hostnames must be configured consistently. Because a module has one fixed `redirect_uri` and session cookies are host-only, wildcard virtual hosts require a registered wildcard redirect URI (for example `https://*.tenant.example.test/_htxpro/auth/workos/callback`), a shared canonical login host, or separate module/host configuration; plain `redirect_uri` values do not fan out per tenant. `authorization_endpoint` and `token_endpoint` must use HTTPS unless they target a loopback host for local testing. `security.session_secret` is the HMAC key for both session and state cookies, must contain at least 32 bytes, and should be generated randomly and kept secret. Rotating it invalidates all existing sessions.
+`redirect_uri` must be registered exactly with WorkOS and normally uses the same public hostname as the protected virtual host. Proxies or alternate public hostnames must be configured consistently. Because a module has one fixed `redirect_uri` and session cookies are host-only, wildcard virtual hosts require a registered wildcard redirect URI (for example `https://*.tenant.example.test/_htxpro/auth/workos/callback`), a shared canonical login host, or separate module/host configuration; plain `redirect_uri` values do not fan out per tenant. `authorization_endpoint` and `token_endpoint` must use HTTPS unless they target a loopback host for local testing. `security.session_secret` is the HMAC key for both session and state cookies and must contain at least 32 bytes. Prefer the exact `${HTXPRO_SESSION_SECRET}` reference so the key is supplied out-of-band rather than stored in YAML. Generate a 256-bit value with `openssl rand -hex 32`; keep it in a permission-restricted environment file or secret manager, persist it across restarts, and never commit it. The application rejects the published example placeholder even though it meets the length requirement. Rotating the key invalidates all existing sessions.
 
 ### Timeout, overload and metrics protection
 
@@ -324,7 +324,7 @@ Controllers live in `src/controllers/`. The dispatcher receives a parsed HTTP/3,
 
 Docker image builds include a C/C++ toolchain, CMake, Clang, `libclang-dev`, Perl, and pkg-config for quiche/BoringSSL, and declare **UDP 8443, TCP 8443 (HTTP/2/HTTPS/1.1), and TCP 8080** (the latter when cleartext HTTP/1.1 and HTTP/2 prior-knowledge is enabled). Publish only the ports you intend to expose. Mount certificate/key files at `/run/secrets/tls_cert` and `/run/secrets/tls_key`, or mount a directory and use lists in YAML, and make sure the container runtime's seccomp policy permits io_uring. Do not use `--privileged` as a workaround; use an explicit, reviewed seccomp profile.
 
-The systemd unit runs as an unprivileged `htxpro` user. Install it and the binary under `/opt/htxpro`, edit `/opt/htxpro/config.yaml`, and ensure the service user can read the private keys and static roots. The bundled config also listens for cleartext HTTP/1.1 and HTTP/2 prior-knowledge on TCP port 8080; firewall that port only if intended for public access.
+The systemd unit runs as an unprivileged `htxpro` user. Install it and the binary under `/opt/htxpro`, edit `/opt/htxpro/config.yaml`, and ensure the service user can read the private keys and static roots. When host authentication is enabled, create `/etc/htxpro/htxpro.env` with `deploy/generate-session-secret.sh`, then set its ownership to `root:htxpro` and mode to `0640`; the unit loads it through `EnvironmentFile`. The bundled config also listens for cleartext HTTP/1.1 and HTTP/2 prior-knowledge on TCP port 8080; firewall that port only if intended for public access.
 
 ## Security and production readiness
 
@@ -333,7 +333,7 @@ The systemd unit runs as an unprivileged `htxpro` user. Install it and the binar
 - Keep private keys readable only by the service account.
 - Do not allow the serving account to modify website roots; avoid symlinks inside served roots.
 - Configure edge rate limiting / DDoS protection and observe structured logs before exposing a public endpoint. Active connection migration is disabled in this version; connections are keyed by destination connection ID to allow multiple connections from one client UDP socket without conflation.
-- Host authentication is opt-in per virtual host and only as strong as the WorkOS application and TLS configuration it references. Register the exact callback URI, protect `session_secret`, keep `cookie_secure: true` outside local testing, and do not expose plain HTTP to browsers that carry session cookies. The configuration file contains the WorkOS `client_secret` and session HMAC key; restrict its read permissions. Authenticated identity is not authorization: routes and controller handlers must still enforce roles or resource ownership.
+- Host authentication is opt-in per virtual host and only as strong as the WorkOS application and TLS configuration it references. Register the exact callback URI, protect `session_secret`, keep `cookie_secure: true` outside local testing, and do not expose plain HTTP to browsers that carry session cookies. Keep WorkOS `client_secret` values in restricted configuration and supply the session HMAC key through a restricted environment file or secret manager. Authenticated identity is not authorization: routes and controller handlers must still enforce roles or resource ownership.
 - Audit controller handlers before enabling mutating API routes. The sample item store is in-memory and has no per-user authorization built in, even when a host requires authentication.
 - Set resource limits, benchmark under representative traffic, and test overload behavior before production deployment.
 

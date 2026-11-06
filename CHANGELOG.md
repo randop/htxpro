@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2]
+
+### Security
+- Reject the published `security.session_secret` example placeholder instead of relying on a length check that allowed a known HMAC key.
+- Allow `security.session_secret: "${HTXPRO_SESSION_SECRET}"` to load a persistent secret from the process environment and fail startup when it is unset or empty.
+- Add a permission-restricted random-secret provisioning script and deployment guidance.
+
 ## [0.7.1]
 
 ### Added
